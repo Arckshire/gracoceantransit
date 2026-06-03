@@ -27,6 +27,11 @@ import streamlit as st
 # Constants
 # ============================================================================
 
+# Bump this string whenever you change column names or cache shapes. It's
+# folded into every cache key so old session_state / @st.cache_data values
+# don't survive an upgrade and cause KeyErrors downstream.
+CODE_VERSION = "2026-06-03-r4"
+
 # 8 ocean milestones. VDL and VAD auto-fall back to their _P44 variants when
 # the carrier-reported value is null.
 MILESTONES: List[Tuple[str, str, List[str]]] = [
@@ -54,7 +59,7 @@ REQUIRED_COLUMNS = {
 
 MAX_PREVIEW_ROWS = 10_000
 
-# Vivid, high-contrast palette for trend lines (works well in PNG export too)
+# Vivid, high-contrast palette for trend lines (renders well in PNG export).
 TREND_COLORS = px.colors.qualitative.Bold + px.colors.qualitative.Vivid
 
 
@@ -67,8 +72,7 @@ def _bytes_hash(b: bytes) -> str:
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def load_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """Cached read. Hashed on file bytes so re-runs are instant."""
+def load_file(file_bytes: bytes, filename: str, _ver: str = CODE_VERSION) -> pd.DataFrame:
     name = filename.lower()
     bio = io.BytesIO(file_bytes)
     if name.endswith((".xlsx", ".xls")):
@@ -88,7 +92,7 @@ def validate_columns(df: pd.DataFrame) -> List[str]:
 # ============================================================================
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def aggregate_to_master_shipment(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_to_master_shipment(df: pd.DataFrame, _ver: str = CODE_VERSION) -> pd.DataFrame:
     """
     Collapse to one row per MASTER_SHIPMENT_ID. `groupby().first()` picks the
     first non-null value in each column per master shipment, so when one
@@ -186,12 +190,22 @@ def hours_to_components(total_hours: float) -> Tuple[int, int]:
 # Transit calculation
 # ============================================================================
 
+# Column names produced by compute_transit — referenced throughout the app.
+# Restored TOTAL_HOURS naming (per user feedback). The d/h split lives in
+# TRANSIT_DAYS + TRANSIT_HOURS; TOTAL_HOURS is the same transit expressed as
+# one numeric value (used for sorting and as input to all downstream stats).
+COL_TOTAL_HOURS    = "TOTAL_HOURS"
+COL_TRANSIT_DAYS   = "TRANSIT_DAYS"
+COL_TRANSIT_HOURS  = "TRANSIT_HOURS"   # the hours-component of the d/h split (0..23)
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
 def compute_transit(
     df: pd.DataFrame,
     start_code: str,
     end_code: str,
     aggregation_level: str,
+    _ver: str = CODE_VERSION,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     base = df
     if aggregation_level == "Master Shipment":
@@ -205,7 +219,7 @@ def compute_transit(
     work["END_TS"]   = end_ts
 
     delta_hours = (end_ts - start_ts).dt.total_seconds() / 3600.0
-    work["DURATION_HOURS_INTERNAL"] = delta_hours
+    work["_DELTA_H"] = delta_hours
 
     reason = pd.Series("", index=work.index, dtype="object")
     reason = reason.mask(start_ts.isna() & end_ts.isna(), f"Missing both {start_code} and {end_code}")
@@ -228,20 +242,17 @@ def compute_transit(
     ]
 
     # --- Calculated ---
-    calc = work.loc[
-        valid_mask,
-        base_cols + ["START_TS", "END_TS", "DURATION_HOURS_INTERNAL"],
-    ].copy()
+    calc = work.loc[valid_mask, base_cols + ["START_TS", "END_TS", "_DELTA_H"]].copy()
     calc.rename(columns={
         "START_TS": f"{start_code}_TS",
         "END_TS":   f"{end_code}_TS",
     }, inplace=True)
 
-    d_series, h_series = hours_to_components_vec(calc["DURATION_HOURS_INTERNAL"])
-    calc["TRANSIT_DAYS"] = d_series
-    calc["TRANSIT_HOURS"] = h_series         # the integer-hour part of the d/h split
-    calc["DURATION_HOURS"] = calc["DURATION_HOURS_INTERNAL"].round(2)  # numeric single-value
-    calc.drop(columns=["DURATION_HOURS_INTERNAL"], inplace=True)
+    d_series, h_series = hours_to_components_vec(calc["_DELTA_H"])
+    calc[COL_TRANSIT_DAYS]  = d_series
+    calc[COL_TRANSIT_HOURS] = h_series
+    calc[COL_TOTAL_HOURS]   = calc["_DELTA_H"].round(2)
+    calc.drop(columns=["_DELTA_H"], inplace=True)
 
     calc.sort_values(["LANE", "CARRIER_NAME", "SHIPMENT_CREATED_DATE"], inplace=True)
     calc.reset_index(drop=True, inplace=True)
@@ -270,25 +281,26 @@ def _stats_dict(label_lane, cname, cscac, agg_row, vol):
         "AVG_HOURS":    hours_to_components(agg_row["mean"])[1],
         "MEDIAN_DAYS":  hours_to_components(agg_row["median"])[0],
         "MEDIAN_HOURS": hours_to_components(agg_row["median"])[1],
-        "MIN_DURATION_HOURS":    round(agg_row["min"], 2),
-        "MAX_DURATION_HOURS":    round(agg_row["max"], 2),
-        "AVG_DURATION_HOURS":    round(agg_row["mean"], 2),
-        "MEDIAN_DURATION_HOURS": round(agg_row["median"], 2),
+        # "AVG_TOTAL_HOURS" = the average per shipment, expressed in total hours
+        "MIN_TOTAL_HOURS":    round(agg_row["min"], 2),
+        "MAX_TOTAL_HOURS":    round(agg_row["max"], 2),
+        "AVG_TOTAL_HOURS":    round(agg_row["mean"], 2),
+        "MEDIAN_TOTAL_HOURS": round(agg_row["median"], 2),
     }
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def build_lane_summary(calc: pd.DataFrame) -> pd.DataFrame:
-    if calc.empty:
+def build_lane_summary(calc: pd.DataFrame, _ver: str = CODE_VERSION) -> pd.DataFrame:
+    if calc.empty or COL_TOTAL_HOURS not in calc.columns:
         return pd.DataFrame()
 
     lane_agg = (
-        calc.groupby("LANE")["DURATION_HOURS"]
+        calc.groupby("LANE")[COL_TOTAL_HOURS]
             .agg(["count", "min", "max", "mean", "median"])
             .sort_values("count", ascending=False)
     )
     carrier_agg = (
-        calc.groupby(["LANE", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)["DURATION_HOURS"]
+        calc.groupby(["LANE", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)[COL_TOTAL_HOURS]
             .agg(["count", "min", "max", "mean", "median"])
     )
 
@@ -314,9 +326,9 @@ def _metric_prefix(metric: str) -> str:
 
 
 def _trend_col_names(metric: str) -> Tuple[str, str, str, str]:
-    """Return (days_col, hours_col, duration_hours_col, decimal_days_col)."""
+    """Return (days_col, hours_col, total_hours_col, decimal_days_col)."""
     p = _metric_prefix(metric)
-    return f"{p}_DAYS", f"{p}_HOURS", f"{p}_DURATION_HOURS", f"{p}_DECIMAL_DAYS"
+    return f"{p}_DAYS", f"{p}_HOURS", f"{p}_TOTAL_HOURS", f"{p}_DECIMAL_DAYS"
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -326,17 +338,25 @@ def build_trend_frame(
     carrier_selection: Tuple[str, ...],
     metric: str,
     aggregation: str,
+    _ver: str = CODE_VERSION,
 ) -> pd.DataFrame:
     """
-    Aggregate per (time bucket, series). Columns are named based on metric
-    so it's unambiguous what the number represents:
-        AVG_DAYS / AVG_HOURS       — days+hours split of the average
-        AVG_DURATION_HOURS         — the average expressed as a single hours number
-        AVG_DECIMAL_DAYS           — same in decimal days (chart Y-axis)
-        SHIPMENT_COUNT             — how many shipments fed into that bucket
-    (Same for MEDIAN_* when metric == 'Median'.)
+    Aggregate per (time bucket, series).
+
+    Column naming is metric-aware so it's unambiguous what each number is:
+        AVG_DAYS / AVG_HOURS       — days+hours split of the average per shipment
+        AVG_TOTAL_HOURS            — the same average expressed as a single hours number
+                                     (this is per-shipment, NOT a sum across shipments)
+        AVG_DECIMAL_DAYS           — same as decimal days (chart Y-axis)
+        SHIPMENT_COUNT             — how many shipments contributed to that bucket
+    Same with MEDIAN_* when metric == 'Median'.
     """
     if calc.empty:
+        return pd.DataFrame()
+    if COL_TOTAL_HOURS not in calc.columns:
+        # Defensive: would happen only if cache/session state is stale relative
+        # to current code. Returning empty here lets the caller render a clean
+        # "no data" message instead of crashing.
         return pd.DataFrame()
 
     df = calc.copy()
@@ -362,24 +382,23 @@ def build_trend_frame(
         df["BUCKET"] = df["SHIPMENT_CREATED_DATE"].dt.to_period("W").dt.start_time
 
     agg_func = "mean" if metric == "Average" else "median"
-    days_col, hours_col, dur_col, dec_col = _trend_col_names(metric)
+    days_col, hours_col, total_col, dec_col = _trend_col_names(metric)
 
     grouped = (
-        df.groupby(["BUCKET", "_SERIES"])["DURATION_HOURS"]
+        df.groupby(["BUCKET", "_SERIES"])[COL_TOTAL_HOURS]
           .agg([agg_func, "count"])
-          .rename(columns={agg_func: dur_col, "count": "SHIPMENT_COUNT"})
+          .rename(columns={agg_func: total_col, "count": "SHIPMENT_COUNT"})
           .reset_index()
           .rename(columns={"_SERIES": "SERIES"})
     )
-    d_s, h_s = hours_to_components_vec(grouped[dur_col])
+    d_s, h_s = hours_to_components_vec(grouped[total_col])
     grouped[days_col] = d_s
     grouped[hours_col] = h_s
-    grouped[dur_col] = grouped[dur_col].round(2)
-    grouped[dec_col] = (grouped[dur_col] / 24).round(3)
+    grouped[total_col] = grouped[total_col].round(2)
+    grouped[dec_col] = (grouped[total_col] / 24).round(3)
 
-    # Order columns nicely
     grouped = grouped[["BUCKET", "SERIES", "SHIPMENT_COUNT",
-                       days_col, hours_col, dur_col, dec_col]]
+                       days_col, hours_col, total_col, dec_col]]
     grouped.sort_values(["BUCKET", "SERIES"], inplace=True)
     return grouped
 
@@ -396,8 +415,7 @@ def make_trend_figure(
     metric: str,
     agg_period: str,
 ):
-    """Build the Plotly line chart from a trend frame."""
-    days_col, hours_col, dur_col, dec_col = _trend_col_names(metric)
+    days_col, hours_col, total_col, dec_col = _trend_col_names(metric)
 
     fig = px.line(
         trend,
@@ -424,10 +442,10 @@ def make_trend_figure(
             "Bucket: %{x|%Y-%m-%d}<br>"
             f"{metric} transit per shipment: "
             "%{customdata[0]}d %{customdata[1]}h "
-            "(%{customdata[2]:.2f} hrs)<br>"
+            "(%{customdata[2]:.2f} total hrs)<br>"
             "n = %{customdata[3]} shipments<extra></extra>"
         ),
-        customdata=trend[[days_col, hours_col, dur_col, "SHIPMENT_COUNT"]].to_numpy(),
+        customdata=trend[[days_col, hours_col, total_col, "SHIPMENT_COUNT"]].to_numpy(),
     )
     fig.update_layout(
         height=520,
@@ -444,7 +462,6 @@ def make_trend_figure(
 
 
 def fig_to_png_bytes(fig, width=1600, height=800, scale=2) -> bytes:
-    """Render figure to PNG with vivid colors preserved."""
     return fig.to_image(format="png", width=width, height=height, scale=scale, engine="kaleido")
 
 
@@ -475,6 +492,7 @@ def _autosize(writer, sheet_name: str, df: pd.DataFrame):
 def write_excel(
     calc: pd.DataFrame, missed: pd.DataFrame, lane_sum: pd.DataFrame,
     start_code: str, end_code: str, aggregation_level: str, raw_row_count: int,
+    _ver: str = CODE_VERSION,
 ) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -493,7 +511,7 @@ def write_excel(
             "Field": [
                 "Start milestone", "End milestone", "Aggregation level",
                 "Raw input rows", "Calculated rows", "Missed rows",
-                "Unique lanes", "Generated at (UTC)",
+                "Unique lanes", "Generated at (UTC)", "Code version",
             ],
             "Value": [
                 MILESTONE_LABELS.get(start_code, start_code),
@@ -502,6 +520,7 @@ def write_excel(
                 raw_row_count, len(calc), len(missed),
                 calc["LANE"].nunique() if not calc.empty else 0,
                 datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                CODE_VERSION,
             ],
         })
         meta.to_excel(writer, sheet_name="Run Info", index=False)
@@ -511,7 +530,6 @@ def write_excel(
 
 
 def write_trend_single(trend: pd.DataFrame, metric: str, agg_period: str) -> bytes:
-    """One-sheet Excel for the currently displayed trend."""
     buf = io.BytesIO()
     sheet = f"{metric}-{agg_period}"[:31]
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
@@ -523,7 +541,6 @@ def write_trend_single(trend: pd.DataFrame, metric: str, agg_period: str) -> byt
 def write_trend_all_four(
     calc: pd.DataFrame, lane_selection: str, carrier_selection: Tuple[str, ...],
 ) -> bytes:
-    """4-sheet Excel: Average-Weekly, Average-Monthly, Median-Weekly, Median-Monthly."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         for metric in ("Average", "Median"):
@@ -543,7 +560,6 @@ def write_all_four_png_zip(
     calc: pd.DataFrame, lane_selection: str, carrier_selection: Tuple[str, ...],
     start_code: str, end_code: str, aggregation_level: str,
 ) -> bytes:
-    """Zip containing 4 PNG charts (all metric × period combos)."""
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
         for metric in ("Average", "Median"):
@@ -553,8 +569,7 @@ def write_all_four_png_zip(
                     continue
                 fig = make_trend_figure(tf, start_code, end_code, aggregation_level, metric, agg)
                 png = fig_to_png_bytes(fig)
-                fname = f"trend_{metric.lower()}_{agg.lower()}.png"
-                zf.writestr(fname, png)
+                zf.writestr(f"trend_{metric.lower()}_{agg.lower()}.png", png)
     return zbuf.getvalue()
 
 
@@ -620,6 +635,20 @@ with st.sidebar:
 
     run = st.button("Run analysis", type="primary", use_container_width=True)
 
+    with st.expander("Troubleshooting"):
+        st.caption(
+            "If you upgrade the app and see a KeyError on cached data, hit "
+            "Reset below — it clears every cache and the session, then "
+            "re-uploads from scratch."
+        )
+        if st.button("🔄 Reset all caches & session", use_container_width=True):
+            st.cache_data.clear()
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+
+    st.caption(f"Code version: `{CODE_VERSION}`")
+
 if uploaded is None:
     st.info("⬅️ Upload a CSV or XLSX file to begin.")
     st.stop()
@@ -639,15 +668,18 @@ if missing:
 if start_code == end_code:
     st.warning("Start and end milestones are the same — transit will be 0 for every shipment.")
 
-if not run and "results" not in st.session_state:
+# Detect stale or missing results — session_state params include CODE_VERSION,
+# so any code upgrade automatically triggers a fresh compute.
+current_params = (CODE_VERSION, _bytes_hash(file_bytes), start_code, end_code, agg_level)
+prev_params = st.session_state.get("results", {}).get("params")
+
+if not run and prev_params is None:
     st.success(f"Loaded {len(raw):,} rows. Configure in the sidebar, then click **Run analysis**.")
     with st.expander("Preview raw data (first 20 rows)"):
         st.dataframe(raw.head(20), use_container_width=True)
     st.stop()
 
-needs_run = run or st.session_state.get("results", {}).get("params") != (
-    _bytes_hash(file_bytes), start_code, end_code, agg_level
-)
+needs_run = run or prev_params != current_params
 if needs_run:
     with st.spinner("Computing transits…"):
         try:
@@ -656,11 +688,15 @@ if needs_run:
         except Exception as e:
             st.error(f"Computation failed: {e}")
             st.stop()
+        # Final safety net: confirm the columns we expect downstream.
+        if COL_TOTAL_HOURS not in calc.columns and not calc.empty:
+            st.error("Internal error: missing TOTAL_HOURS column. Try Reset in the sidebar.")
+            st.stop()
         st.session_state["results"] = {
             "calc": calc, "missed": missed, "lane_sum": lane_sum,
             "start_code": start_code, "end_code": end_code,
             "agg_level": agg_level, "raw_count": len(raw),
-            "params": (_bytes_hash(file_bytes), start_code, end_code, agg_level),
+            "params": current_params,
         }
 
 results    = st.session_state["results"]
@@ -688,9 +724,12 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 with tab1:
     st.subheader(f"Transit: {start_code} → {end_code}  ·  level: {agg_level}")
-    st.caption("`DURATION_HOURS` is each shipment's transit expressed as a single "
-               "number in hours (for sorting). `TRANSIT_DAYS` + `TRANSIT_HOURS` "
-               "are the days + hours split (e.g., 36h → 1d 12h).")
+    st.caption(
+        "**Column guide.** `TRANSIT_DAYS` + `TRANSIT_HOURS` are the d+h split "
+        "(e.g., 36 hours → 1d 12h). `TOTAL_HOURS` is the same transit expressed "
+        "as one numeric value in hours — useful for sorting / filtering, and the "
+        "input to every aggregate stat downstream."
+    )
     if len(calc) > MAX_PREVIEW_ROWS:
         st.caption(f"Showing first {MAX_PREVIEW_ROWS:,} of {len(calc):,} rows. "
                    "Full data is in the Excel download below.")
@@ -707,10 +746,12 @@ with tab2:
 
 with tab3:
     st.subheader("Per-lane breakdown")
-    st.caption("First row per lane block = ALL CARRIERS for that lane. "
-               "Following rows = each carrier (ordered by descending volume). "
-               "`AVG_DURATION_HOURS` is the average transit (single number, in hours) "
-               "across shipments in that group — same for MIN / MAX / MEDIAN.")
+    st.caption(
+        "First row per lane block = ALL CARRIERS for that lane. Following rows "
+        "= each carrier (ordered by descending volume). `AVG_TOTAL_HOURS` is "
+        "the **average per shipment** for that group, expressed in hours — "
+        "NOT a sum across shipments. Same idea for `MIN/MAX/MEDIAN_TOTAL_HOURS`."
+    )
     st.dataframe(lane_sum, use_container_width=True, hide_index=True)
 
 with tab4:
@@ -768,17 +809,18 @@ with tab4:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # Inline reading guide for the columns the user will see in the data table
-            days_col, hours_col, dur_col, dec_col = _trend_col_names(metric_choice)
+            days_col, hours_col, total_col, dec_col = _trend_col_names(metric_choice)
             with st.expander("Underlying data — how to read the columns"):
                 st.markdown(
                     f"- **BUCKET** — start date of the {agg_choice.lower()} period.\n"
                     f"- **SERIES** — carrier (or ‘All Carriers’ when aggregated).\n"
                     f"- **SHIPMENT_COUNT** — how many eligible shipments contributed to that point.\n"
                     f"- **`{days_col}` / `{hours_col}`** — the {metric_choice.lower()} expressed as "
-                    f"days + hours (e.g., `42d 16h`). These are the d/h split, NOT a sum.\n"
-                    f"- **`{dur_col}`** — the same {metric_choice.lower()} expressed as a single number in hours "
-                    f"(e.g., 1024.46). This is the average/median **per shipment**, not a total across shipments.\n"
+                    f"days + hours (e.g., `42d 16h`). These are the d/h split of the per-shipment "
+                    f"{metric_choice.lower()}, NOT a sum.\n"
+                    f"- **`{total_col}`** — the same {metric_choice.lower()} expressed as a single "
+                    f"number in total hours (e.g., 1024.46). This is the **{metric_choice.lower()} "
+                    f"per shipment**, not a total across shipments.\n"
                     f"- **`{dec_col}`** — the same {metric_choice.lower()} as decimal days "
                     f"(this is what the chart plots on the Y-axis)."
                 )
