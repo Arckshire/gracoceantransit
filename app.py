@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import zipfile
 from datetime import datetime
 from typing import List, Tuple
 
@@ -42,11 +43,7 @@ MILESTONES: List[Tuple[str, str, List[str]]] = [
 MILESTONE_LABELS  = {c: f"{c} — {d}" for c, d, _ in MILESTONES}
 MILESTONE_SOURCES = {c: s for c, _, s in MILESTONES}
 MILESTONE_ORDER   = [c for c, _, _ in MILESTONES]
-ALL_MILESTONE_COLS = sorted({c for _, _, srcs in MILESTONES for c in srcs})
 
-# Minimum columns required for the tool to run. Milestone columns are checked
-# at calculation time (a missing milestone column is treated as all-null,
-# which just routes shipments to the missed sheet — the tool still runs).
 REQUIRED_COLUMNS = {
     "SHIPMENT_ID", "MASTER_SHIPMENT_ID", "CONTAINER_NUMBER",
     "CARRIER_NAME", "CARRIER_SCAC",
@@ -55,9 +52,10 @@ REQUIRED_COLUMNS = {
     "SHIPMENT_CREATED_DATE",
 }
 
-# Cap how many rows we render in the on-screen preview tables. The full data
-# always goes to the Excel download — this only protects the UI.
 MAX_PREVIEW_ROWS = 10_000
+
+# Vivid, high-contrast palette for trend lines (works well in PNG export too)
+TREND_COLORS = px.colors.qualitative.Bold + px.colors.qualitative.Vivid
 
 
 # ============================================================================
@@ -92,13 +90,9 @@ def validate_columns(df: pd.DataFrame) -> List[str]:
 @st.cache_data(show_spinner=False, max_entries=4)
 def aggregate_to_master_shipment(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Collapse to one row per MASTER_SHIPMENT_ID.
-
-    Strategy: groupby().first() (skipna=True) picks the first non-null value
-    in each column per master shipment. Containers under the same master
-    shipment normally share milestones; if one container has a milestone and
-    another doesn't, we keep the populated value (more permissive).
-
+    Collapse to one row per MASTER_SHIPMENT_ID. `groupby().first()` picks the
+    first non-null value in each column per master shipment, so when one
+    container has a milestone and another doesn't, we keep the populated one.
     Adds CONTAINER_COUNT (how many containers were rolled up).
     """
     if "MASTER_SHIPMENT_ID" not in df.columns:
@@ -106,14 +100,9 @@ def aggregate_to_master_shipment(df: pd.DataFrame) -> pd.DataFrame:
 
     container_counts = (
         df.groupby("MASTER_SHIPMENT_ID")["CONTAINER_NUMBER"]
-          .nunique()
-          .rename("CONTAINER_COUNT")
+          .nunique().rename("CONTAINER_COUNT")
     )
-    # .first() returns the first non-NA value per column per group — fast & vectorized
-    grouped = (
-        df.groupby("MASTER_SHIPMENT_ID", as_index=False, sort=False)
-          .first()
-    )
+    grouped = df.groupby("MASTER_SHIPMENT_ID", as_index=False, sort=False).first()
     grouped = grouped.merge(container_counts, on="MASTER_SHIPMENT_ID", how="left")
     grouped["CONTAINER_COUNT"] = grouped["CONTAINER_COUNT"].fillna(1).astype(int)
     return grouped
@@ -124,11 +113,6 @@ def aggregate_to_master_shipment(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def resolve_milestone(df: pd.DataFrame, code: str) -> pd.Series:
-    """
-    Return a tz-aware UTC datetime Series for the milestone. For VDL/VAD,
-    falls back to _P44 whenever the primary column is null. Tolerant to
-    missing source columns (treats them as all-null).
-    """
     sources = MILESTONE_SOURCES[code]
     result = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
     for src in sources:
@@ -144,7 +128,6 @@ def resolve_milestone(df: pd.DataFrame, code: str) -> pd.Series:
 # ============================================================================
 
 def build_lane_keys(df: pd.DataFrame) -> pd.DataFrame:
-    """Add POL_FULL, POD_FULL, LANE columns vectorized."""
     out = df.copy()
 
     def _fmt(locode_col, city_col, ctry_col):
@@ -153,17 +136,15 @@ def build_lane_keys(df: pd.DataFrame) -> pd.DataFrame:
         ctry = out[ctry_col].fillna("").astype(str).str.strip()
         place = np.where(
             (city != "") & (ctry != ""), city + ", " + ctry,
-            np.where(city != "", city, ctry)
+            np.where(city != "", city, ctry),
         )
         place = pd.Series(place, index=out.index)
-        # Join "LOCODE - place" only when both pieces exist
         result = np.where(
             (loc != "") & (place != ""), loc + " - " + place,
-            np.where(loc != "", loc, place)
+            np.where(loc != "", loc, place),
         )
         result = pd.Series(result, index=out.index)
-        result = result.where(result != "", "Unknown")
-        return result
+        return result.where(result != "", "Unknown")
 
     out["POL_FULL"] = _fmt("POL_LOCODE", "POL", "POL_COUNTRY")
     out["POD_FULL"] = _fmt("POD_LOCODE", "POD", "POD_COUNTRY")
@@ -176,28 +157,19 @@ def build_lane_keys(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def hours_to_components_vec(hours: pd.Series) -> Tuple[pd.Series, pd.Series]:
-    """
-    Vectorized conversion of fractional hours -> (days, remainder_hours) as
-    Int64 (nullable). Carries 24h up to a day. Handles NaN.
-    """
-    # Round to minute precision to avoid float jitter
+    """Vectorized: fractional hours → (days, remainder_hours) as nullable Int64."""
     total_minutes = (hours * 60).round()
     days = np.floor_divide(total_minutes, 24 * 60)
     rem_minutes = total_minutes - days * 24 * 60
     hours_part = (rem_minutes / 60).round()
 
-    # 23h59.5m -> 24h after rounding -> bump to next day
     carry = hours_part == 24
     days = days.where(~carry, days + 1)
     hours_part = hours_part.where(~carry, 0)
-
-    days_int = days.astype("Int64")
-    hours_int = hours_part.astype("Int64")
-    return days_int, hours_int
+    return days.astype("Int64"), hours_part.astype("Int64")
 
 
 def hours_to_components(total_hours: float) -> Tuple[int, int]:
-    """Scalar version for summary rows. Returns (np.nan, np.nan) if null."""
     if pd.isna(total_hours):
         return (np.nan, np.nan)
     total_minutes = int(round(total_hours * 60))
@@ -219,13 +191,8 @@ def compute_transit(
     df: pd.DataFrame,
     start_code: str,
     end_code: str,
-    aggregation_level: str,   # "Container" or "Master Shipment"
+    aggregation_level: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Return (calculated_df, missed_df).
-      calculated_df: both milestones present AND end > start.
-      missed_df:     anything else, with a MISSED_REASON column.
-    """
     base = df
     if aggregation_level == "Master Shipment":
         base = aggregate_to_master_shipment(df)
@@ -238,9 +205,8 @@ def compute_transit(
     work["END_TS"]   = end_ts
 
     delta_hours = (end_ts - start_ts).dt.total_seconds() / 3600.0
-    work["TRANSIT_HOURS"] = delta_hours
+    work["DURATION_HOURS_INTERNAL"] = delta_hours
 
-    # Reason classification (vectorized)
     reason = pd.Series("", index=work.index, dtype="object")
     reason = reason.mask(start_ts.isna() & end_ts.isna(), f"Missing both {start_code} and {end_code}")
     reason = reason.mask(start_ts.isna() & end_ts.notna(), f"Missing {start_code} (start)")
@@ -251,7 +217,6 @@ def compute_transit(
 
     valid_mask = start_ts.notna() & end_ts.notna() & (delta_hours > 0)
 
-    # Build display column list — include MSID + container count when aggregated
     base_cols = ["SHIPMENT_ID", "MASTER_SHIPMENT_ID", "CONTAINER_NUMBER"]
     if aggregation_level == "Master Shipment" and "CONTAINER_COUNT" in work.columns:
         base_cols.append("CONTAINER_COUNT")
@@ -263,14 +228,20 @@ def compute_transit(
     ]
 
     # --- Calculated ---
-    calc = work.loc[valid_mask, base_cols + ["START_TS", "END_TS", "TRANSIT_HOURS"]].copy()
-    calc.rename(columns={"START_TS": f"{start_code}_TS", "END_TS": f"{end_code}_TS"}, inplace=True)
+    calc = work.loc[
+        valid_mask,
+        base_cols + ["START_TS", "END_TS", "DURATION_HOURS_INTERNAL"],
+    ].copy()
+    calc.rename(columns={
+        "START_TS": f"{start_code}_TS",
+        "END_TS":   f"{end_code}_TS",
+    }, inplace=True)
 
-    d_series, h_series = hours_to_components_vec(calc["TRANSIT_HOURS"])
+    d_series, h_series = hours_to_components_vec(calc["DURATION_HOURS_INTERNAL"])
     calc["TRANSIT_DAYS"] = d_series
-    calc["TRANSIT_HOURS_REMAINDER"] = h_series
-    calc["TOTAL_HOURS"] = calc["TRANSIT_HOURS"].round(2)
-    calc.drop(columns=["TRANSIT_HOURS"], inplace=True)
+    calc["TRANSIT_HOURS"] = h_series         # the integer-hour part of the d/h split
+    calc["DURATION_HOURS"] = calc["DURATION_HOURS_INTERNAL"].round(2)  # numeric single-value
+    calc.drop(columns=["DURATION_HOURS_INTERNAL"], inplace=True)
 
     calc.sort_values(["LANE", "CARRIER_NAME", "SHIPMENT_CREATED_DATE"], inplace=True)
     calc.reset_index(drop=True, inplace=True)
@@ -278,7 +249,6 @@ def compute_transit(
     # --- Missed ---
     missed = work.loc[~valid_mask, base_cols + ["MISSED_REASON"]].copy()
     missed.reset_index(drop=True, inplace=True)
-
     return calc, missed
 
 
@@ -287,7 +257,6 @@ def compute_transit(
 # ============================================================================
 
 def _stats_dict(label_lane, cname, cscac, agg_row, vol):
-    """Build a row dict from a pre-aggregated stats row."""
     return {
         "LANE": label_lane,
         "CARRIER_NAME": cname,
@@ -301,38 +270,31 @@ def _stats_dict(label_lane, cname, cscac, agg_row, vol):
         "AVG_HOURS":    hours_to_components(agg_row["mean"])[1],
         "MEDIAN_DAYS":  hours_to_components(agg_row["median"])[0],
         "MEDIAN_HOURS": hours_to_components(agg_row["median"])[1],
-        "MIN_TOTAL_HOURS":    round(agg_row["min"], 2),
-        "MAX_TOTAL_HOURS":    round(agg_row["max"], 2),
-        "AVG_TOTAL_HOURS":    round(agg_row["mean"], 2),
-        "MEDIAN_TOTAL_HOURS": round(agg_row["median"], 2),
+        "MIN_DURATION_HOURS":    round(agg_row["min"], 2),
+        "MAX_DURATION_HOURS":    round(agg_row["max"], 2),
+        "AVG_DURATION_HOURS":    round(agg_row["mean"], 2),
+        "MEDIAN_DURATION_HOURS": round(agg_row["median"], 2),
     }
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def build_lane_summary(calc: pd.DataFrame) -> pd.DataFrame:
-    """
-    Lane block: ALL CARRIERS row first (lane name shown), then one row per
-    carrier (lane left blank), ordered by descending volume within each block.
-    Blocks themselves ordered by descending lane volume.
-    """
     if calc.empty:
         return pd.DataFrame()
 
-    # Two groupbys, then iterate — O(N) instead of O(L*N)
     lane_agg = (
-        calc.groupby("LANE")["TOTAL_HOURS"]
+        calc.groupby("LANE")["DURATION_HOURS"]
             .agg(["count", "min", "max", "mean", "median"])
             .sort_values("count", ascending=False)
     )
     carrier_agg = (
-        calc.groupby(["LANE", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)["TOTAL_HOURS"]
+        calc.groupby(["LANE", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)["DURATION_HOURS"]
             .agg(["count", "min", "max", "mean", "median"])
     )
 
     rows: List[dict] = []
     for lane, lstats in lane_agg.iterrows():
         rows.append(_stats_dict(lane, "ALL CARRIERS", "ALL", lstats, lstats["count"]))
-        # Carriers within this lane, by descending volume
         try:
             sub = carrier_agg.loc[lane].sort_values("count", ascending=False)
         except KeyError:
@@ -347,15 +309,33 @@ def build_lane_summary(calc: pd.DataFrame) -> pd.DataFrame:
 # Trend data
 # ============================================================================
 
-@st.cache_data(show_spinner=False, max_entries=32)
+def _metric_prefix(metric: str) -> str:
+    return "AVG" if metric == "Average" else "MEDIAN"
+
+
+def _trend_col_names(metric: str) -> Tuple[str, str, str, str]:
+    """Return (days_col, hours_col, duration_hours_col, decimal_days_col)."""
+    p = _metric_prefix(metric)
+    return f"{p}_DAYS", f"{p}_HOURS", f"{p}_DURATION_HOURS", f"{p}_DECIMAL_DAYS"
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
 def build_trend_frame(
     calc: pd.DataFrame,
     lane_selection: str,
-    carrier_selection: Tuple[str, ...],   # tuple so it's hashable for cache
+    carrier_selection: Tuple[str, ...],
     metric: str,
     aggregation: str,
 ) -> pd.DataFrame:
-    """Aggregate per time bucket × series (carrier or 'All Carriers')."""
+    """
+    Aggregate per (time bucket, series). Columns are named based on metric
+    so it's unambiguous what the number represents:
+        AVG_DAYS / AVG_HOURS       — days+hours split of the average
+        AVG_DURATION_HOURS         — the average expressed as a single hours number
+        AVG_DECIMAL_DAYS           — same in decimal days (chart Y-axis)
+        SHIPMENT_COUNT             — how many shipments fed into that bucket
+    (Same for MEDIAN_* when metric == 'Median'.)
+    """
     if calc.empty:
         return pd.DataFrame()
 
@@ -382,24 +362,94 @@ def build_trend_frame(
         df["BUCKET"] = df["SHIPMENT_CREATED_DATE"].dt.to_period("W").dt.start_time
 
     agg_func = "mean" if metric == "Average" else "median"
+    days_col, hours_col, dur_col, dec_col = _trend_col_names(metric)
+
     grouped = (
-        df.groupby(["BUCKET", "_SERIES"])["TOTAL_HOURS"]
+        df.groupby(["BUCKET", "_SERIES"])["DURATION_HOURS"]
           .agg([agg_func, "count"])
-          .rename(columns={agg_func: "VALUE_TOTAL_HOURS", "count": "VOLUME"})
+          .rename(columns={agg_func: dur_col, "count": "SHIPMENT_COUNT"})
           .reset_index()
           .rename(columns={"_SERIES": "SERIES"})
     )
-    d_s, h_s = hours_to_components_vec(grouped["VALUE_TOTAL_HOURS"])
-    grouped["VALUE_DAYS"] = d_s
-    grouped["VALUE_HOURS_REMAINDER"] = h_s
-    grouped["VALUE_TOTAL_HOURS"] = grouped["VALUE_TOTAL_HOURS"].round(2)
-    grouped["VALUE_DAYS_DECIMAL"] = (grouped["VALUE_TOTAL_HOURS"] / 24).round(3)
+    d_s, h_s = hours_to_components_vec(grouped[dur_col])
+    grouped[days_col] = d_s
+    grouped[hours_col] = h_s
+    grouped[dur_col] = grouped[dur_col].round(2)
+    grouped[dec_col] = (grouped[dur_col] / 24).round(3)
+
+    # Order columns nicely
+    grouped = grouped[["BUCKET", "SERIES", "SHIPMENT_COUNT",
+                       days_col, hours_col, dur_col, dec_col]]
     grouped.sort_values(["BUCKET", "SERIES"], inplace=True)
     return grouped
 
 
 # ============================================================================
-# Excel writer
+# Plotly figure builder
+# ============================================================================
+
+def make_trend_figure(
+    trend: pd.DataFrame,
+    start_code: str,
+    end_code: str,
+    aggregation_level: str,
+    metric: str,
+    agg_period: str,
+):
+    """Build the Plotly line chart from a trend frame."""
+    days_col, hours_col, dur_col, dec_col = _trend_col_names(metric)
+
+    fig = px.line(
+        trend,
+        x="BUCKET",
+        y=dec_col,
+        color="SERIES",
+        markers=True,
+        color_discrete_sequence=TREND_COLORS,
+        labels={
+            "BUCKET": f"{agg_period} bucket (anchor: SHIPMENT_CREATED_DATE)",
+            dec_col: f"{metric} transit (days)",
+            "SERIES": "Carrier",
+        },
+        title=(
+            f"{metric} transit — {start_code} → {end_code} "
+            f"({agg_period.lower()}, {aggregation_level.lower()}-level)"
+        ),
+    )
+    fig.update_traces(
+        line=dict(width=3),
+        marker=dict(size=8),
+        hovertemplate=(
+            "<b>%{fullData.name}</b><br>"
+            "Bucket: %{x|%Y-%m-%d}<br>"
+            f"{metric} transit per shipment: "
+            "%{customdata[0]}d %{customdata[1]}h "
+            "(%{customdata[2]:.2f} hrs)<br>"
+            "n = %{customdata[3]} shipments<extra></extra>"
+        ),
+        customdata=trend[[days_col, hours_col, dur_col, "SHIPMENT_COUNT"]].to_numpy(),
+    )
+    fig.update_layout(
+        height=520,
+        hovermode="x unified",
+        template="plotly_white",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        legend=dict(title="Carrier", orientation="v"),
+        margin=dict(l=60, r=40, t=70, b=60),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.08)", rangemode="tozero")
+    return fig
+
+
+def fig_to_png_bytes(fig, width=1600, height=800, scale=2) -> bytes:
+    """Render figure to PNG with vivid colors preserved."""
+    return fig.to_image(format="png", width=width, height=height, scale=scale, engine="kaleido")
+
+
+# ============================================================================
+# Excel writers
 # ============================================================================
 
 def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
@@ -423,31 +473,22 @@ def _autosize(writer, sheet_name: str, df: pd.DataFrame):
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def write_excel(
-    calc: pd.DataFrame,
-    missed: pd.DataFrame,
-    lane_sum: pd.DataFrame,
-    start_code: str,
-    end_code: str,
-    aggregation_level: str,
-    raw_row_count: int,
+    calc: pd.DataFrame, missed: pd.DataFrame, lane_sum: pd.DataFrame,
+    start_code: str, end_code: str, aggregation_level: str, raw_row_count: int,
 ) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        # Sheet 1: Calculated
         calc_out = _strip_tz(calc)
         calc_out.to_excel(writer, sheet_name="Calculated Transit", index=False)
         _autosize(writer, "Calculated Transit", calc_out)
 
-        # Sheet 2: Missed
         missed_out = _strip_tz(missed)
         missed_out.to_excel(writer, sheet_name="Missed Milestones", index=False)
         _autosize(writer, "Missed Milestones", missed_out)
 
-        # Sheet 3: Lane × Carrier summary
         lane_sum.to_excel(writer, sheet_name="Lane x Carrier Summary", index=False)
         _autosize(writer, "Lane x Carrier Summary", lane_sum)
 
-        # Sheet 4: Run Info
         meta = pd.DataFrame({
             "Field": [
                 "Start milestone", "End milestone", "Aggregation level",
@@ -458,21 +499,66 @@ def write_excel(
                 MILESTONE_LABELS.get(start_code, start_code),
                 MILESTONE_LABELS.get(end_code, end_code),
                 aggregation_level,
-                raw_row_count,
-                len(calc),
-                len(missed),
+                raw_row_count, len(calc), len(missed),
                 calc["LANE"].nunique() if not calc.empty else 0,
                 datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             ],
         })
         meta.to_excel(writer, sheet_name="Run Info", index=False)
         _autosize(writer, "Run Info", meta)
-
     buf.seek(0)
     return buf.getvalue()
 
 
-def _chart_filename(lane, carriers, metric, agg, ext) -> str:
+def write_trend_single(trend: pd.DataFrame, metric: str, agg_period: str) -> bytes:
+    """One-sheet Excel for the currently displayed trend."""
+    buf = io.BytesIO()
+    sheet = f"{metric}-{agg_period}"[:31]
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        trend.to_excel(w, sheet_name=sheet, index=False)
+        _autosize(w, sheet, trend)
+    return buf.getvalue()
+
+
+def write_trend_all_four(
+    calc: pd.DataFrame, lane_selection: str, carrier_selection: Tuple[str, ...],
+) -> bytes:
+    """4-sheet Excel: Average-Weekly, Average-Monthly, Median-Weekly, Median-Monthly."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        for metric in ("Average", "Median"):
+            for agg in ("Weekly", "Monthly"):
+                tf = build_trend_frame(calc, lane_selection, carrier_selection, metric, agg)
+                sheet = f"{metric}-{agg}"[:31]
+                if tf.empty:
+                    pd.DataFrame({"info": ["No data for this combination."]}) \
+                        .to_excel(w, sheet_name=sheet, index=False)
+                else:
+                    tf.to_excel(w, sheet_name=sheet, index=False)
+                    _autosize(w, sheet, tf)
+    return buf.getvalue()
+
+
+def write_all_four_png_zip(
+    calc: pd.DataFrame, lane_selection: str, carrier_selection: Tuple[str, ...],
+    start_code: str, end_code: str, aggregation_level: str,
+) -> bytes:
+    """Zip containing 4 PNG charts (all metric × period combos)."""
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for metric in ("Average", "Median"):
+            for agg in ("Weekly", "Monthly"):
+                tf = build_trend_frame(calc, lane_selection, carrier_selection, metric, agg)
+                if tf.empty:
+                    continue
+                fig = make_trend_figure(tf, start_code, end_code, aggregation_level, metric, agg)
+                png = fig_to_png_bytes(fig)
+                fname = f"trend_{metric.lower()}_{agg.lower()}.png"
+                zf.writestr(fname, png)
+    return zbuf.getvalue()
+
+
+def _filename(prefix, lane, carriers, ext, suffix=""):
     lane_part = "all-lanes" if lane == "All Lanes" else lane.split(" - ")[0].lower()
     if "All Carriers" in carriers:
         carr_part = "all-carriers"
@@ -481,7 +567,11 @@ def _chart_filename(lane, carriers, metric, agg, ext) -> str:
     else:
         carr_part = f"{len(carriers)}-carriers"
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    return f"trend_{lane_part}_{carr_part}_{metric.lower()}_{agg.lower()}_{ts}.{ext}"
+    parts = [prefix, lane_part, carr_part]
+    if suffix:
+        parts.append(suffix)
+    parts.append(ts)
+    return "_".join(parts) + "." + ext
 
 
 # ============================================================================
@@ -511,33 +601,29 @@ with st.sidebar:
         "Aggregation level",
         options=["Container", "Master Shipment"],
         index=0,
-        help=(
-            "**Container** = one row per CONTAINER_NUMBER.\n\n"
-            "**Master Shipment** = collapse containers under the same "
-            "MASTER_SHIPMENT_ID into a single row (first non-null milestone "
-            "per group). A CONTAINER_COUNT column shows how many were rolled up."
-        ),
+        help=("**Container** = one row per CONTAINER_NUMBER.\n\n"
+              "**Master Shipment** = collapse containers under the same "
+              "MASTER_SHIPMENT_ID into a single row (first non-null milestone "
+              "per group). A CONTAINER_COUNT column shows how many were rolled up."),
     )
     start_code = st.selectbox(
         "Transit START milestone",
-        options=MILESTONE_ORDER, index=2,  # CLL
+        options=MILESTONE_ORDER, index=2,
         format_func=lambda c: MILESTONE_LABELS[c],
     )
     end_code = st.selectbox(
         "Transit END milestone",
-        options=MILESTONE_ORDER, index=4,  # VAD
+        options=MILESTONE_ORDER, index=4,
         format_func=lambda c: MILESTONE_LABELS[c],
     )
     st.caption("ℹ️ VDL/VAD auto-fall back to their _P44 variants when null.")
 
     run = st.button("Run analysis", type="primary", use_container_width=True)
 
-# Block until a file is uploaded
 if uploaded is None:
     st.info("⬅️ Upload a CSV or XLSX file to begin.")
     st.stop()
 
-# Load & validate
 try:
     file_bytes = uploaded.getvalue()
     raw = load_file(file_bytes, uploaded.name)
@@ -553,18 +639,15 @@ if missing:
 if start_code == end_code:
     st.warning("Start and end milestones are the same — transit will be 0 for every shipment.")
 
-# Sanity preview before any computation
 if not run and "results" not in st.session_state:
     st.success(f"Loaded {len(raw):,} rows. Configure in the sidebar, then click **Run analysis**.")
     with st.expander("Preview raw data (first 20 rows)"):
         st.dataframe(raw.head(20), use_container_width=True)
     st.stop()
 
-# Detect parameter changes — invalidate cached results if config changed
 needs_run = run or st.session_state.get("results", {}).get("params") != (
     _bytes_hash(file_bytes), start_code, end_code, agg_level
 )
-
 if needs_run:
     with st.spinner("Computing transits…"):
         try:
@@ -574,13 +657,9 @@ if needs_run:
             st.error(f"Computation failed: {e}")
             st.stop()
         st.session_state["results"] = {
-            "calc": calc,
-            "missed": missed,
-            "lane_sum": lane_sum,
-            "start_code": start_code,
-            "end_code": end_code,
-            "agg_level": agg_level,
-            "raw_count": len(raw),
+            "calc": calc, "missed": missed, "lane_sum": lane_sum,
+            "start_code": start_code, "end_code": end_code,
+            "agg_level": agg_level, "raw_count": len(raw),
             "params": (_bytes_hash(file_bytes), start_code, end_code, agg_level),
         }
 
@@ -592,12 +671,10 @@ start_code = results["start_code"]
 end_code   = results["end_code"]
 agg_level  = results["agg_level"]
 
-# ---- Top-line metrics ----
 c1, c2, c3, c4 = st.columns(4)
-c1.metric(f"Input rows ({agg_level.lower()}-level after agg)",
+c1.metric(f"Input rows ({agg_level.lower()}-level)",
           f"{(len(calc) + len(missed)):,}",
-          delta=f"raw: {results['raw_count']:,}",
-          delta_color="off")
+          delta=f"raw: {results['raw_count']:,}", delta_color="off")
 c2.metric("Calculated", f"{len(calc):,}")
 c3.metric("Missed / ineligible", f"{len(missed):,}")
 c4.metric("Unique lanes", f"{calc['LANE'].nunique() if not calc.empty else 0:,}")
@@ -611,6 +688,9 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 with tab1:
     st.subheader(f"Transit: {start_code} → {end_code}  ·  level: {agg_level}")
+    st.caption("`DURATION_HOURS` is each shipment's transit expressed as a single "
+               "number in hours (for sorting). `TRANSIT_DAYS` + `TRANSIT_HOURS` "
+               "are the days + hours split (e.g., 36h → 1d 12h).")
     if len(calc) > MAX_PREVIEW_ROWS:
         st.caption(f"Showing first {MAX_PREVIEW_ROWS:,} of {len(calc):,} rows. "
                    "Full data is in the Excel download below.")
@@ -628,11 +708,15 @@ with tab2:
 with tab3:
     st.subheader("Per-lane breakdown")
     st.caption("First row per lane block = ALL CARRIERS for that lane. "
-               "Following rows = each carrier (ordered by descending volume).")
+               "Following rows = each carrier (ordered by descending volume). "
+               "`AVG_DURATION_HOURS` is the average transit (single number, in hours) "
+               "across shipments in that group — same for MIN / MAX / MEDIAN.")
     st.dataframe(lane_sum, use_container_width=True, hide_index=True)
 
 with tab4:
     st.subheader("Transit trend over time")
+    st.caption("The carrier dropdown only lists carriers that have at least one "
+               "**calculated** (eligible) shipment on the selected lane.")
 
     if calc.empty:
         st.info("No calculated transits to plot.")
@@ -645,7 +729,6 @@ with tab4:
         with col_a:
             lane_choice = st.selectbox("Lane", options=["All Lanes"] + lanes_sorted, index=0)
 
-        # Carrier pool depends on lane
         if lane_choice == "All Lanes":
             carrier_pool = sorted(calc["CARRIER_NAME"].dropna().unique().tolist())
         else:
@@ -680,65 +763,91 @@ with tab4:
         if trend.empty:
             st.info("No data for this lane × carrier combination.")
         else:
-            fig = px.line(
-                trend,
-                x="BUCKET",
-                y="VALUE_DAYS_DECIMAL",
-                color="SERIES",
-                markers=True,
-                labels={
-                    "BUCKET": f"{agg_choice} bucket (anchor: SHIPMENT_CREATED_DATE)",
-                    "VALUE_DAYS_DECIMAL": f"{metric_choice} transit (days)",
-                    "SERIES": "Carrier",
-                },
-                title=f"{metric_choice} transit — {start_code} → {end_code} "
-                      f"({agg_choice.lower()}, {agg_level.lower()}-level)",
+            fig = make_trend_figure(
+                trend, start_code, end_code, agg_level, metric_choice, agg_choice
             )
-            fig.update_traces(
-                hovertemplate=(
-                    "<b>%{fullData.name}</b><br>"
-                    "Bucket: %{x|%Y-%m-%d}<br>"
-                    "Transit: %{customdata[0]}d %{customdata[1]}h "
-                    "(%{customdata[2]} total hrs)<br>"
-                    "Shipments: %{customdata[3]}<extra></extra>"
-                ),
-                customdata=trend[
-                    ["VALUE_DAYS", "VALUE_HOURS_REMAINDER",
-                     "VALUE_TOTAL_HOURS", "VOLUME"]
-                ].to_numpy(),
-            )
-            fig.update_layout(height=520, hovermode="x unified")
             st.plotly_chart(fig, use_container_width=True)
 
-            with st.expander("Underlying trend data"):
+            # Inline reading guide for the columns the user will see in the data table
+            days_col, hours_col, dur_col, dec_col = _trend_col_names(metric_choice)
+            with st.expander("Underlying data — how to read the columns"):
+                st.markdown(
+                    f"- **BUCKET** — start date of the {agg_choice.lower()} period.\n"
+                    f"- **SERIES** — carrier (or ‘All Carriers’ when aggregated).\n"
+                    f"- **SHIPMENT_COUNT** — how many eligible shipments contributed to that point.\n"
+                    f"- **`{days_col}` / `{hours_col}`** — the {metric_choice.lower()} expressed as "
+                    f"days + hours (e.g., `42d 16h`). These are the d/h split, NOT a sum.\n"
+                    f"- **`{dur_col}`** — the same {metric_choice.lower()} expressed as a single number in hours "
+                    f"(e.g., 1024.46). This is the average/median **per shipment**, not a total across shipments.\n"
+                    f"- **`{dec_col}`** — the same {metric_choice.lower()} as decimal days "
+                    f"(this is what the chart plots on the Y-axis)."
+                )
                 st.dataframe(trend, use_container_width=True, hide_index=True)
 
-            # Chart exports — shareable alongside the main Excel
-            export_cols = st.columns(2)
-            with export_cols[0]:
-                try:
-                    png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
+            # -------- Download options --------
+            st.markdown("**Export trend chart / data**")
+            scope = st.radio(
+                "Scope",
+                ["Current view only", "All 4 combinations (Avg/Median × Weekly/Monthly)"],
+                horizontal=True,
+                key="trend_scope",
+            )
+
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                if scope == "Current view only":
+                    try:
+                        png_bytes = fig_to_png_bytes(fig)
+                        st.download_button(
+                            "⬇️ Download chart as PNG",
+                            data=png_bytes,
+                            file_name=_filename(
+                                "trend", lane_choice, carrier_choice, "png",
+                                suffix=f"{metric_choice.lower()}-{agg_choice.lower()}",
+                            ),
+                            mime="image/png",
+                            use_container_width=True,
+                        )
+                    except Exception as e:
+                        st.caption(f"PNG export failed: {e}")
+                else:
+                    with st.spinner("Rendering 4 charts…"):
+                        zip_bytes = write_all_four_png_zip(
+                            calc, lane_choice, tuple(carrier_choice),
+                            start_code, end_code, agg_level,
+                        )
                     st.download_button(
-                        "⬇️ Download chart as PNG",
-                        data=png_bytes,
-                        file_name=_chart_filename(lane_choice, carrier_choice, metric_choice, agg_choice, "png"),
-                        mime="image/png",
+                        "⬇️ Download all 4 charts as ZIP (PNG)",
+                        data=zip_bytes,
+                        file_name=_filename("trend-all4", lane_choice, carrier_choice, "zip"),
+                        mime="application/zip",
                         use_container_width=True,
                     )
-                except Exception:
-                    st.caption("PNG export unavailable (install `kaleido` per requirements.txt).")
-            with export_cols[1]:
-                trend_buf = io.BytesIO()
-                with pd.ExcelWriter(trend_buf, engine="xlsxwriter") as w:
-                    trend.to_excel(w, sheet_name="Trend Data", index=False)
-                    _autosize(w, "Trend Data", trend)
-                st.download_button(
-                    "⬇️ Download trend data as Excel",
-                    data=trend_buf.getvalue(),
-                    file_name=_chart_filename(lane_choice, carrier_choice, metric_choice, agg_choice, "xlsx"),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
+
+            with col_dl2:
+                if scope == "Current view only":
+                    st.download_button(
+                        "⬇️ Download trend data as Excel",
+                        data=write_trend_single(trend, metric_choice, agg_choice),
+                        file_name=_filename(
+                            "trend", lane_choice, carrier_choice, "xlsx",
+                            suffix=f"{metric_choice.lower()}-{agg_choice.lower()}",
+                        ),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                else:
+                    with st.spinner("Building 4-sheet Excel…"):
+                        xlsx_bytes = write_trend_all_four(
+                            calc, lane_choice, tuple(carrier_choice)
+                        )
+                    st.download_button(
+                        "⬇️ Download all 4 as Excel (4 sheets)",
+                        data=xlsx_bytes,
+                        file_name=_filename("trend-all4", lane_choice, carrier_choice, "xlsx"),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
 
 # ---- Main Excel download ----
 st.divider()
