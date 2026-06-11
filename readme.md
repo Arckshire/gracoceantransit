@@ -24,25 +24,89 @@ with any file that follows the same column schema.
      the tool falls back to the `_P44` computed variant automatically.
 4. **Get an Excel report** with four sheets:
    - **Calculated Transit** — one row per eligible shipment with `START_TS`,
-     `END_TS`, `TRANSIT_DAYS`, `TRANSIT_HOURS_REMAINDER`, `TOTAL_HOURS`.
-     36 hours displays as `Days=1, Hours=12` — not `1.5 days`.
+     `END_TS`, `TRANSIT_DAYS`, `TRANSIT_HOURS`, `TOTAL_HOURS`.
+     36 hours displays as `TRANSIT_DAYS=1, TRANSIT_HOURS=12` — not `1.5 days`.
+     `TOTAL_HOURS` is the same transit expressed as a single number in hours
+     (e.g., `36.00`) — useful for sorting / filtering, and the value that
+     feeds every aggregate stat downstream.
    - **Missed Milestones** — shipments excluded because a milestone was null
      or the end timestamp was not strictly after the start. `MISSED_REASON`
      explains each row.
    - **Lane × Carrier Summary** — per unique lane block: one `ALL CARRIERS`
      row first, then one row per carrier on that lane (ordered by descending
-     volume). Statistics are min / max / average / median in days + hours
-     plus numeric `*_TOTAL_HOURS` columns for sorting.
-   - **Run Info** — milestones, aggregation level, row counts, timestamp.
-5. **Trends tab** — interactive chart with:
-   - Single-select **Lane** (or "All Lanes").
-   - Multi-select **Carrier(s)**, scoped to the chosen lane. "All Carriers"
-     is mutually exclusive with specific carriers (enforced in code).
-   - Toggle between **Average** and **Median** transit time.
-   - Toggle between **Weekly** and **Monthly** aggregation.
-   - Time bucket is anchored on `SHIPMENT_CREATED_DATE`.
-   - Download the rendered chart as **PNG** and the underlying data as a
-     standalone Excel — share alongside the main report.
+     volume). Statistics are min / max / average / median in days + hours.
+     `AVG_TOTAL_HOURS` is the **average per shipment** for that group
+     expressed in total hours (NOT a sum across shipments). Same idea for
+     `MIN/MAX/MEDIAN_TOTAL_HOURS`.
+   - **Run Info** — milestones, aggregation level, row counts, timestamp,
+     code version.
+5. **Trends & Consistency tab** — TWO interactive charts:
+   - **Chart 1 — Transit time.** Per-carrier lines (one color per carrier)
+     plus a bold black "Combined (all selected)" line, with gray bars in the
+     background showing container volume per bucket. Use this to set SAP
+     lead times and compare carrier speed.
+   - **Chart 2 — Transit-time consistency (std dev).** Per-carrier dotted
+     std-dev lines plus a bold dashed black combined std-dev line, same
+     gray volume bars. Lower = more consistent. Use this to pick reliable
+     carriers. Buckets where a carrier had only **1 shipment** are shown
+     as a hollow marker — std dev is mathematically undefined with one
+     data point.
+   - Filters: single-select **Lane** (or "All Lanes"), multi-select
+     **Carrier(s)** (scoped to the chosen lane — only carriers with at
+     least one eligible shipment appear). "All Carriers" is mutually
+     exclusive with specific carriers.
+   - Toggles: **Average** vs **Median** (drives Chart 1's center line),
+     **Weekly** vs **Monthly** bucket. Time bucket is anchored on
+     `SHIPMENT_CREATED_DATE`. Overlay checkboxes let you hide volume bars,
+     the combined line, or per-carrier lines.
+   - **Export scope toggle**:
+     - "Current view" → zip with the 2 PNGs you're looking at + Excel
+       with a Key sheet and 2 data sheets.
+     - "Full pack" → zip with **6 PNGs** (transit avg/median ×
+       weekly/monthly, plus std-dev weekly + monthly) and an Excel with
+       a **Key sheet + 6 data sheets**. This is what you'd send a customer
+       as the trend deliverable for a single lane.
+   - **📦 Bulk lane export** — at the bottom of the Trends tab. Multi-select
+     any number of lanes (or one click "include all"), hit Generate, and
+     get ONE master ZIP back containing **one folder per lane**. Each lane
+     folder has the 6 PNGs + `data_with_key.xlsx` (Key + 6 sheets) — same
+     content as if you'd run the Full pack manually on that lane. A
+     `README.txt` at the root of the master ZIP lists every lane included
+     and what each file is. Lanes stay independent — no combining or
+     averaging across lanes. Use this when a customer asks for the
+     standard pack across many lanes at once.
+   - Data column naming (each row = one carrier OR `Combined (all selected)` in one bucket):
+     - `BUCKET` — start date of the week/month period.
+     - `SERIES` — carrier name, or `Combined (all selected)`.
+     - `SHIPMENT_COUNT` — containers from THIS series in this bucket.
+     - `TOTAL_BUCKET_VOLUME` — containers in the bucket across ALL selected
+       carriers (same value across every row in that bucket).
+     - `AVG_DAYS` / `AVG_HOURS` — average **per shipment** as d+h
+       (e.g., `42d 16h`). NOT a sum. Same idea for `MEDIAN_*`.
+     - `AVG_TOTAL_HOURS` — average per shipment as a single hours number
+       (for sorting). Same idea for `MEDIAN_TOTAL_HOURS`.
+     - `AVG_DECIMAL_DAYS` / `MEDIAN_DECIMAL_DAYS` — what the chart Y-axis plots.
+     - `STDEV_HOURS` / `STDEV_DECIMAL_DAYS` — std dev of transit times in
+       that bucket. Blank when `SHIPMENT_COUNT < 2`.
+     - `NOTES` — flags edge cases like `"1 shipment only — std dev N/A"`.
+
+---
+
+## Troubleshooting
+
+If you upgrade the app (e.g., pull a new version from GitHub onto Streamlit
+Cloud) and see a `KeyError: Column not found` after the deploy, it means
+your browser still has a stale session pointing at the previous run's
+DataFrame. Two fixes, both safe:
+
+- Click **🔄 Reset all caches & session** in the sidebar's Troubleshooting
+  expander, then re-upload.
+- Or just refresh the page hard (Ctrl/Cmd + Shift + R).
+
+The app embeds a `CODE_VERSION` constant into every cache key, so any
+schema-breaking change automatically forces a fresh compute the next time
+you hit Run. The Reset button is there for the in-between moment if you've
+been clicking around in a stale session.
 
 ---
 
