@@ -36,7 +36,7 @@ import streamlit as st
 
 # Bump on any schema/column change. Folded into every cache key so old
 # session_state / @st.cache_data values can't survive an upgrade.
-CODE_VERSION = "2026-06-11-r6"
+CODE_VERSION = "2026-06-11-r7"
 
 MILESTONES: List[Tuple[str, str, List[str]]] = [
     ("CEP", "Empty Container Pickup",      ["CEP"]),
@@ -699,10 +699,21 @@ def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _autosize(writer, sheet_name: str, df: pd.DataFrame):
+    """
+    Column-width auto-sizer. Bulletproofed against any dtype/value weirdness —
+    runs each value through str() inside the comprehension, and falls back to
+    just the header length on any unexpected error so it can never crash the
+    Excel write.
+    """
     ws = writer.sheets[sheet_name]
     for i, col in enumerate(df.columns):
-        sample = df[col].astype(str).head(200).tolist()
-        max_len = max([len(str(col))] + [len(v) for v in sample]) if sample else len(str(col))
+        header_len = len(str(col))
+        try:
+            values = df[col].head(200).tolist()
+            sample = [str(v) for v in values]
+            max_len = max([header_len] + [len(s) for s in sample]) if sample else header_len
+        except Exception:
+            max_len = header_len
         ws.set_column(i, i, min(max_len + 2, 40))
     ws.freeze_panes(1, 0)
 
@@ -841,10 +852,9 @@ def write_trend_pack_excel(
                     pd.DataFrame({"info": ["No data for this combination."]}) \
                         .to_excel(w, sheet_name=sheet, index=False)
                 else:
-                    # Drop helper column before write
-                    tf.drop(columns=[c for c in ["IS_COMBINED"] if c in tf.columns]) \
-                      .to_excel(w, sheet_name=sheet, index=False)
-                    _autosize(w, sheet, tf)
+                    view = tf.drop(columns=["IS_COMBINED"], errors="ignore")
+                    view.to_excel(w, sheet_name=sheet, index=False)
+                    _autosize(w, sheet, view)
 
         for agg in ("Weekly", "Monthly"):
             sf = build_stddev_frame(calc, lane_selection, carrier_selection, agg)
@@ -853,9 +863,9 @@ def write_trend_pack_excel(
                 pd.DataFrame({"info": ["No data for this combination."]}) \
                     .to_excel(w, sheet_name=sheet, index=False)
             else:
-                sf.drop(columns=[c for c in ["IS_COMBINED"] if c in sf.columns]) \
-                  .to_excel(w, sheet_name=sheet, index=False)
-                _autosize(w, sheet, sf)
+                view = sf.drop(columns=["IS_COMBINED"], errors="ignore")
+                view.to_excel(w, sheet_name=sheet, index=False)
+                _autosize(w, sheet, view)
     return buf.getvalue()
 
 
@@ -913,11 +923,15 @@ def write_bulk_lane_pack_zip(
     start_code: str, end_code: str, aggregation_level: str,
     show_volume: bool = True, show_combined: bool = True, show_per_carrier: bool = True,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    master_excel_bytes: Optional[bytes] = None,
 ) -> bytes:
     """
     Build ONE master ZIP containing per-lane folders. Each lane folder holds
     the 6 PNGs (4 transit + 2 std-dev) plus the data Excel (Key + 6 sheets).
     Lanes stay independent — each pack uses the carriers active on THAT lane.
+
+    If `master_excel_bytes` is provided, it's dropped at the root of the ZIP
+    as `00_master_report.xlsx` so the bulk pack carries the full deliverable.
     """
     zbuf = io.BytesIO()
     skipped: List[str] = []
@@ -974,6 +988,10 @@ def write_bulk_lane_pack_zip(
             excel_bytes = write_trend_pack_excel(calc, lane, lane_carriers)
             outer.writestr(folder + "data_with_key.xlsx", excel_bytes)
 
+        # Master Excel at root (if provided)
+        if master_excel_bytes is not None:
+            outer.writestr("00_master_report.xlsx", master_excel_bytes)
+
         # Root README.txt
         included = [l for l in lanes if l not in skipped]
         readme_lines = [
@@ -983,6 +1001,17 @@ def write_bulk_lane_pack_zip(
             f"Milestone pair:   {start_code} → {end_code}",
             f"Aggregation:      {aggregation_level}",
             f"Lanes included:   {len(included)}",
+            "",
+            "Files at the root:",
+        ]
+        if master_excel_bytes is not None:
+            readme_lines += [
+                "  • 00_master_report.xlsx        — master report across ALL lanes",
+                "                                   (Calculated, Missed, Lane × Carrier",
+                "                                    Summary, Run Info)",
+            ]
+        readme_lines += [
+            "  • README.txt                   — this file",
             "",
             "Each folder is one lane. Inside each folder:",
             "  • transit_average_weekly.png    — avg transit trend, weekly",
@@ -1342,17 +1371,15 @@ with tab4:
                         _format_key_sheet(w, w.sheets["Key"])
                         w.sheets["Key"].freeze_panes(1, 0)
 
+                        t_view = transit_df.drop(columns=["IS_COMBINED"], errors="ignore")
                         t_sheet = f"{metric_choice}-{agg_choice}"[:31]
-                        transit_df.drop(columns=["IS_COMBINED"]).to_excel(
-                            w, sheet_name=t_sheet, index=False
-                        )
-                        _autosize(w, t_sheet, transit_df)
+                        t_view.to_excel(w, sheet_name=t_sheet, index=False)
+                        _autosize(w, t_sheet, t_view)
 
+                        s_view = stddev_df.drop(columns=["IS_COMBINED"], errors="ignore")
                         s_sheet = f"StdDev-{agg_choice}"[:31]
-                        stddev_df.drop(columns=["IS_COMBINED"]).to_excel(
-                            w, sheet_name=s_sheet, index=False
-                        )
-                        _autosize(w, s_sheet, stddev_df)
+                        s_view.to_excel(w, sheet_name=s_sheet, index=False)
+                        _autosize(w, s_sheet, s_view)
                     st.download_button(
                         "⬇️ Download current data as Excel (Key + 2 sheets)",
                         data=buf.getvalue(),
@@ -1428,12 +1455,20 @@ with tab4:
                     progress.progress(pct, text=f"Lane {i+1} of {total}: {lane}")
 
                 try:
+                    # Build the master report Excel once and include it at the
+                    # root of the bulk ZIP, so the customer-facing deliverable
+                    # is fully self-contained in one download.
+                    master_xlsx = write_excel(
+                        calc, missed, lane_sum,
+                        start_code, end_code, agg_level, results["raw_count"],
+                    )
                     bulk_bytes = write_bulk_lane_pack_zip(
                         calc, bulk_lanes,
                         start_code, end_code, agg_level,
                         show_volume=show_volume, show_combined=show_combined,
                         show_per_carrier=show_per_carrier,
                         progress_callback=_cb,
+                        master_excel_bytes=master_xlsx,
                     )
                 except Exception as e:
                     st.error(f"Bulk pack build failed: {e}")
