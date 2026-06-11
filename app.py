@@ -34,9 +34,9 @@ import streamlit as st
 # Constants
 # ============================================================================
 
-# Bump on any schema/column change. Folded into every cache key so old
-# session_state / @st.cache_data values can't survive an upgrade.
-CODE_VERSION = "2026-06-11-r7"
+# Bump on any schema/column or render-shape change. Folded into every cache key
+# so old session_state / @st.cache_data values can't survive an upgrade.
+CODE_VERSION = "2026-06-11-r9"
 
 MILESTONES: List[Tuple[str, str, List[str]]] = [
     ("CEP", "Empty Container Pickup",      ["CEP"]),
@@ -62,7 +62,6 @@ REQUIRED_COLUMNS = {
 
 MAX_PREVIEW_ROWS = 10_000
 
-# High-contrast palette for carrier lines (works in PNG export too).
 CARRIER_PALETTE = px.colors.qualitative.Bold + px.colors.qualitative.Vivid
 COMBINED_COLOR  = "#000000"
 VOLUME_COLOR    = "#bcbcbc"
@@ -71,6 +70,16 @@ COL_TOTAL_HOURS    = "TOTAL_HOURS"
 COL_TRANSIT_DAYS   = "TRANSIT_DAYS"
 COL_TRANSIT_HOURS  = "TRANSIT_HOURS"
 COMBINED_LABEL     = "Combined (all selected)"
+
+# Threshold for the "low sample size" warning shown on the chart.
+LOW_SAMPLE_THRESHOLD = 10
+
+# Bar widths (in milliseconds) — controls how wide each volume bar renders
+# on the time axis. ~25 days for monthly, ~5 days for weekly leaves a clean
+# gap between adjacent bars.
+DAY_MS = 24 * 60 * 60 * 1000
+BAR_WIDTH_MONTHLY = 25 * DAY_MS
+BAR_WIDTH_WEEKLY  = 5  * DAY_MS
 
 
 # ============================================================================
@@ -300,8 +309,6 @@ def _trend_col_names(metric: str) -> Tuple[str, str, str, str]:
 
 
 def _container_volume(df: pd.DataFrame) -> pd.Series:
-    """One value per row representing how many containers it covers.
-    Container mode: always 1. MSID mode: CONTAINER_COUNT."""
     if "CONTAINER_COUNT" in df.columns:
         return df["CONTAINER_COUNT"].fillna(1).astype(int)
     return pd.Series(1, index=df.index, dtype=int)
@@ -328,15 +335,8 @@ def build_transit_frame(
     carrier_selection: Tuple[str, ...], metric: str, aggregation: str,
     _ver: str = CODE_VERSION,
 ) -> pd.DataFrame:
-    """
-    Long-form: one row per (bucket × series). SERIES is the carrier name OR
-    'Combined (all selected)'. Columns include the metric value split into
-    days+hours plus a single-number TOTAL_HOURS, decimal days, bucket-wide
-    container volume, this-series shipment count, and a NOTES column.
-    """
     if calc.empty or COL_TOTAL_HOURS not in calc.columns:
         return pd.DataFrame()
-
     df = calc.copy()
     df = df.dropna(subset=["SHIPMENT_CREATED_DATE"])
     if lane_selection != "All Lanes":
@@ -354,10 +354,8 @@ def build_transit_frame(
     agg_func = "mean" if metric == "Average" else "median"
     days_col, hours_col, total_col, dec_col = _trend_col_names(metric)
 
-    # Per-bucket total container volume (sum across all selected carriers)
     bucket_vol = df.groupby("BUCKET")["_VOL"].sum().rename("TOTAL_BUCKET_VOLUME")
 
-    # Per-carrier rows
     per_c = (
         df.groupby(["BUCKET", "CARRIER_NAME"])
           .agg(SHIPMENT_COUNT=("_VOL", "sum"),
@@ -367,7 +365,6 @@ def build_transit_frame(
     )
     per_c["IS_COMBINED"] = False
 
-    # Combined rows
     comb = (
         df.groupby("BUCKET")
           .agg(SHIPMENT_COUNT=("_VOL", "sum"),
@@ -399,13 +396,8 @@ def build_stddev_frame(
     carrier_selection: Tuple[str, ...], aggregation: str,
     _ver: str = CODE_VERSION,
 ) -> pd.DataFrame:
-    """
-    Std dev frame, long form. STDEV_HOURS / STDEV_DAYS are NaN when
-    SHIPMENT_COUNT < 2 (mathematically undefined). NOTES flags these.
-    """
     if calc.empty or COL_TOTAL_HOURS not in calc.columns:
         return pd.DataFrame()
-
     df = calc.copy()
     df = df.dropna(subset=["SHIPMENT_CREATED_DATE"])
     if lane_selection != "All Lanes":
@@ -452,24 +444,79 @@ def build_stddev_frame(
 
 
 # ============================================================================
-# Figures
+# Figures — visual polish lives here
 # ============================================================================
+
+def _bar_width(agg_period: str) -> int:
+    return BAR_WIDTH_MONTHLY if agg_period == "Monthly" else BAR_WIDTH_WEEKLY
+
+
+def _setup_x_axis(fig, agg_period: str):
+    """Force aligned ticks on monthly/weekly axes so bars sit under their labels."""
+    if agg_period == "Monthly":
+        fig.update_xaxes(dtick="M1", tickformat="%b %Y", tickangle=0,
+                         ticklabelmode="period")
+    else:
+        fig.update_xaxes(dtick=7 * DAY_MS, tickformat="%b %d", tickangle=-30)
+
 
 def _carrier_color_map(series_names: List[str]) -> dict:
     pure = [s for s in series_names if s != COMBINED_LABEL]
     return {name: CARRIER_PALETTE[i % len(CARRIER_PALETTE)] for i, name in enumerate(pure)}
 
 
-def _add_volume_bars(fig, bucket_vol_df, name="Container volume"):
+def _add_volume_bars(fig, bucket_vol_df, agg_period, name="Container volume"):
     fig.add_trace(
         go.Bar(
-            x=bucket_vol_df["BUCKET"], y=bucket_vol_df["TOTAL_BUCKET_VOLUME"],
+            x=bucket_vol_df["BUCKET"],
+            y=bucket_vol_df["TOTAL_BUCKET_VOLUME"],
             name=name,
-            marker=dict(color=VOLUME_COLOR, opacity=0.55),
+            marker=dict(color=VOLUME_COLOR, opacity=0.55,
+                        line=dict(color="#aaaaaa", width=0.5)),
+            width=_bar_width(agg_period),
             hovertemplate="<b>%{fullData.name}</b><br>%{x|%Y-%m-%d}<br>%{y} containers<extra></extra>",
         ),
         secondary_y=True,
     )
+
+
+def _small_sample_warning(total_shipments: int, lane_label: str) -> Optional[str]:
+    if total_shipments < LOW_SAMPLE_THRESHOLD:
+        return (f"⚠️ Small sample — only {total_shipments} shipment(s) on this "
+                f"selection. Trends may be noisy; treat with caution.")
+    return None
+
+
+def _add_bottom_annotations(fig, lines: List[str]):
+    """Drop one or more text lines under the chart (below the legend)."""
+    if not lines:
+        return
+    text = "<br>".join(lines)
+    fig.add_annotation(
+        text=text,
+        xref="paper", yref="paper",
+        x=0, y=-0.40, xanchor="left", yanchor="top",
+        showarrow=False,
+        font=dict(size=11, color="#555"),
+        align="left",
+    )
+    # Make sure the bottom margin has room for the annotation + legend.
+    fig.update_layout(margin=dict(l=70, r=70, t=110, b=170))
+
+
+def _singles_summary(df: pd.DataFrame, agg_period: str) -> Optional[str]:
+    """Build a clean text line listing single-shipment per-carrier buckets."""
+    singles = df[(df["SHIPMENT_COUNT"] == 1) & (df["SERIES"] != COMBINED_LABEL)]
+    if singles.empty:
+        return None
+    fmt = "%b %Y" if agg_period == "Monthly" else "%b %d, %Y"
+    items = []
+    for _, r in singles.iterrows():
+        items.append(f"{r['SERIES']} ({pd.to_datetime(r['BUCKET']).strftime(fmt)})")
+    if len(items) <= 6:
+        return f"Single-shipment buckets (std dev N/A): {', '.join(items)}"
+    return (f"Single-shipment buckets (std dev N/A): "
+            f"{', '.join(items[:6])} + {len(items) - 6} more — see Excel NOTES column")
 
 
 def make_transit_figure(
@@ -485,7 +532,7 @@ def make_transit_figure(
         .sort_values("BUCKET")
     )
     if show_volume:
-        _add_volume_bars(fig, bucket_vol)
+        _add_volume_bars(fig, bucket_vol, agg_period)
 
     color_map = _carrier_color_map(transit_df["SERIES"].unique().tolist())
 
@@ -500,8 +547,7 @@ def make_transit_figure(
                     marker=dict(size=7),
                     customdata=sub[[days_col, hours_col, total_col, "SHIPMENT_COUNT"]].to_numpy(),
                     hovertemplate=(
-                        f"<b>{name}</b><br>"
-                        "%{x|%Y-%m-%d}<br>"
+                        f"<b>{name}</b><br>%{{x|%Y-%m-%d}}<br>"
                         f"{metric} transit per shipment: %{{customdata[0]}}d %{{customdata[1]}}h "
                         "(%{customdata[2]:.2f} total hrs)<br>"
                         "n = %{customdata[3]} containers<extra></extra>"
@@ -513,17 +559,17 @@ def make_transit_figure(
     if show_combined:
         comb = transit_df[transit_df["SERIES"] == COMBINED_LABEL].sort_values("BUCKET")
         if not comb.empty:
+            # Same line style as per-carrier lines, distinguished only by black color.
             fig.add_trace(
                 go.Scatter(
                     x=comb["BUCKET"], y=comb[dec_col],
                     name=f"Combined {metric.lower()} (all selected)",
                     mode="lines+markers",
-                    line=dict(color=COMBINED_COLOR, width=4),
-                    marker=dict(size=10, symbol="diamond"),
+                    line=dict(color=COMBINED_COLOR, width=2.5),
+                    marker=dict(size=7),
                     customdata=comb[[days_col, hours_col, total_col, "SHIPMENT_COUNT"]].to_numpy(),
                     hovertemplate=(
-                        f"<b>Combined {metric.lower()}</b><br>"
-                        "%{x|%Y-%m-%d}<br>"
+                        f"<b>Combined {metric.lower()}</b><br>%{{x|%Y-%m-%d}}<br>"
                         f"{metric} transit per shipment: %{{customdata[0]}}d %{{customdata[1]}}h "
                         "(%{customdata[2]:.2f} total hrs)<br>"
                         "n = %{customdata[3]} containers in bucket<extra></extra>"
@@ -532,6 +578,9 @@ def make_transit_figure(
                 secondary_y=False,
             )
 
+    total_shipments = int(transit_df.loc[transit_df["SERIES"] == COMBINED_LABEL,
+                                         "SHIPMENT_COUNT"].sum())
+
     fig.update_layout(
         title=dict(
             text=(f"<b>Transit time ({metric.lower()} per shipment)</b><br>"
@@ -539,19 +588,27 @@ def make_transit_figure(
                   f"{agg_period.lower()} · {aggregation_level.lower()}-level</sub>"),
             x=0.5, xanchor="center",
         ),
-        height=560, template="plotly_white",
+        height=580, template="plotly_white",
         paper_bgcolor="white", plot_bgcolor="white",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=-0.28, xanchor="center", x=0.5),
-        margin=dict(l=70, r=70, t=110, b=110),
-        bargap=0.4,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.30, xanchor="center", x=0.5),
+        margin=dict(l=70, r=70, t=110, b=140),
+        bargap=0.3,
     )
-    fig.update_xaxes(title_text=f"{agg_period} bucket (anchor: SHIPMENT_CREATED_DATE)",
-                     showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+    _setup_x_axis(fig, agg_period)
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                     title_text=f"{agg_period} bucket (anchor: SHIPMENT_CREATED_DATE)")
     fig.update_yaxes(title_text=f"{metric} transit (days)", secondary_y=False,
-                     rangemode="tozero", showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+                     rangemode="tozero", showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                     automargin=True)
     fig.update_yaxes(title_text="Container volume (bars)", secondary_y=True,
-                     rangemode="tozero", showgrid=False)
+                     rangemode="tozero", showgrid=False, automargin=True)
+
+    # Bottom annotations: small-sample warning if applicable
+    warning = _small_sample_warning(total_shipments, lane_label)
+    if warning:
+        _add_bottom_annotations(fig, [warning])
+
     return fig
 
 
@@ -567,120 +624,109 @@ def make_stddev_figure(
         .sort_values("BUCKET")
     )
     if show_volume:
-        _add_volume_bars(fig, bucket_vol)
+        _add_volume_bars(fig, bucket_vol, agg_period)
 
     color_map = _carrier_color_map(stddev_df["SERIES"].unique().tolist())
 
-    def _split_for_plot(sub: pd.DataFrame):
-        """Return two frames: regular (count>=2) and singletons (count==1)."""
-        regular = sub[sub["SHIPMENT_COUNT"] >= 2].copy()
-        single  = sub[sub["SHIPMENT_COUNT"] == 1].copy()
-        # For singletons, std dev is N/A — plot a hollow marker at y=0 so the
-        # user sees the carrier was active but can read "1 ship" in the hover.
-        single["STDEV_DECIMAL_DAYS"] = 0.0
-        return regular, single
-
+    # Only plot bucket points where std dev is defined (n >= 2).
+    # Single-shipment buckets get summarized as a clean text annotation below.
     if show_per_carrier:
         for name in [s for s in stddev_df["SERIES"].unique() if s != COMBINED_LABEL]:
-            sub = stddev_df[stddev_df["SERIES"] == name].sort_values("BUCKET")
-            regular, single = _split_for_plot(sub)
-            if not regular.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=regular["BUCKET"], y=regular["STDEV_DECIMAL_DAYS"],
-                        name=f"{name} std dev", mode="lines+markers",
-                        line=dict(color=color_map[name], width=2, dash="dot"),
-                        marker=dict(size=6),
-                        customdata=regular[["STDEV_HOURS", "SHIPMENT_COUNT"]].to_numpy(),
-                        hovertemplate=(
-                            f"<b>{name} std dev</b><br>"
-                            "%{x|%Y-%m-%d}<br>"
-                            "±%{y:.2f} days  (%{customdata[0]:.2f} hrs)<br>"
-                            "n = %{customdata[1]} containers<extra></extra>"
-                        ),
+            sub = stddev_df[(stddev_df["SERIES"] == name) &
+                            (stddev_df["SHIPMENT_COUNT"] >= 2)].sort_values("BUCKET")
+            if sub.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["BUCKET"], y=sub["STDEV_DECIMAL_DAYS"],
+                    name=f"{name} std dev", mode="lines+markers",
+                    line=dict(color=color_map[name], width=2, dash="dot"),
+                    marker=dict(size=6),
+                    customdata=sub[["STDEV_HOURS", "SHIPMENT_COUNT"]].to_numpy(),
+                    hovertemplate=(
+                        f"<b>{name} std dev</b><br>%{{x|%Y-%m-%d}}<br>"
+                        "±%{y:.2f} days (%{customdata[0]:.2f} hrs)<br>"
+                        "n = %{customdata[1]} containers<extra></extra>"
                     ),
-                    secondary_y=False,
-                )
-            if not single.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=single["BUCKET"], y=single["STDEV_DECIMAL_DAYS"],
-                        name=f"{name} (1 shipment — std dev N/A)",
-                        mode="markers",
-                        marker=dict(size=10, symbol="circle-open",
-                                    color=color_map[name], line=dict(width=2)),
-                        hovertemplate=(
-                            f"<b>{name}</b><br>"
-                            "%{x|%Y-%m-%d}<br>"
-                            "1 shipment only — std dev N/A<extra></extra>"
-                        ),
-                        showlegend=False,
-                    ),
-                    secondary_y=False,
-                )
+                ),
+                secondary_y=False,
+            )
 
     if show_combined:
-        comb = stddev_df[stddev_df["SERIES"] == COMBINED_LABEL].sort_values("BUCKET")
+        comb = stddev_df[(stddev_df["SERIES"] == COMBINED_LABEL) &
+                         (stddev_df["SHIPMENT_COUNT"] >= 2)].sort_values("BUCKET")
         if not comb.empty:
-            regular, single = _split_for_plot(comb)
-            if not regular.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=regular["BUCKET"], y=regular["STDEV_DECIMAL_DAYS"],
-                        name="Combined std dev (all selected)",
-                        mode="lines+markers",
-                        line=dict(color=COMBINED_COLOR, width=4, dash="dash"),
-                        marker=dict(size=10, symbol="x"),
-                        customdata=regular[["STDEV_HOURS", "SHIPMENT_COUNT"]].to_numpy(),
-                        hovertemplate=(
-                            "<b>Combined std dev</b><br>"
-                            "%{x|%Y-%m-%d}<br>"
-                            "±%{y:.2f} days  (%{customdata[0]:.2f} hrs)<br>"
-                            "n = %{customdata[1]} containers in bucket<extra></extra>"
-                        ),
+            fig.add_trace(
+                go.Scatter(
+                    x=comb["BUCKET"], y=comb["STDEV_DECIMAL_DAYS"],
+                    name="Combined std dev (all selected)",
+                    mode="lines+markers",
+                    line=dict(color=COMBINED_COLOR, width=4, dash="dash"),
+                    marker=dict(size=11, symbol="x"),
+                    customdata=comb[["STDEV_HOURS", "SHIPMENT_COUNT"]].to_numpy(),
+                    hovertemplate=(
+                        "<b>Combined std dev</b><br>%{x|%Y-%m-%d}<br>"
+                        "±%{y:.2f} days (%{customdata[0]:.2f} hrs)<br>"
+                        "n = %{customdata[1]} containers in bucket<extra></extra>"
                     ),
-                    secondary_y=False,
-                )
-            if not single.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=single["BUCKET"], y=single["STDEV_DECIMAL_DAYS"],
-                        name="Combined (1 shipment — std dev N/A)",
-                        mode="markers",
-                        marker=dict(size=12, symbol="circle-open",
-                                    color=COMBINED_COLOR, line=dict(width=2)),
-                        hovertemplate=("<b>Combined</b><br>%{x|%Y-%m-%d}<br>"
-                                       "1 shipment only — std dev N/A<extra></extra>"),
-                        showlegend=False,
-                    ),
-                    secondary_y=False,
-                )
+                ),
+                secondary_y=False,
+            )
+
+    total_shipments = int(stddev_df.loc[stddev_df["SERIES"] == COMBINED_LABEL,
+                                        "SHIPMENT_COUNT"].sum())
 
     fig.update_layout(
         title=dict(
             text=(f"<b>Transit-time consistency (std dev)</b><br>"
-                  f"<sub>Lower = more consistent · {lane_label} · "
+                  f"<sub>Spread of shipment transit times around the bucket average · "
+                  f"Lower = more consistent · {lane_label} · "
                   f"{start_code} → {end_code} · {agg_period.lower()} · "
                   f"{aggregation_level.lower()}-level</sub>"),
             x=0.5, xanchor="center",
         ),
-        height=560, template="plotly_white",
+        height=580, template="plotly_white",
         paper_bgcolor="white", plot_bgcolor="white",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=-0.28, xanchor="center", x=0.5),
-        margin=dict(l=70, r=70, t=110, b=110),
-        bargap=0.4,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.30, xanchor="center", x=0.5),
+        margin=dict(l=70, r=70, t=110, b=170),
+        bargap=0.3,
     )
-    fig.update_xaxes(title_text=f"{agg_period} bucket (anchor: SHIPMENT_CREATED_DATE)",
-                     showgrid=True, gridcolor="rgba(0,0,0,0.08)")
-    fig.update_yaxes(title_text="Std dev of transit (± days)", secondary_y=False,
-                     rangemode="tozero", showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+    _setup_x_axis(fig, agg_period)
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                     title_text=f"{agg_period} bucket (anchor: SHIPMENT_CREATED_DATE)")
+
+    # Y-axis: lift y=0 slightly off the X-axis line so std-dev=0 markers don't
+    # get bisected by the axis (the "semicircle on the bottom" look).
+    max_stdev = stddev_df["STDEV_DECIMAL_DAYS"].max()
+    if pd.notna(max_stdev) and max_stdev > 0:
+        y_top = float(max_stdev) * 1.10
+        y_bot = -float(max_stdev) * 0.05
+        fig.update_yaxes(title_text="Std dev of transit (± days)", secondary_y=False,
+                         range=[y_bot, y_top],
+                         showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                         automargin=True)
+    else:
+        fig.update_yaxes(title_text="Std dev of transit (± days)", secondary_y=False,
+                         rangemode="tozero", showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+                         automargin=True)
     fig.update_yaxes(title_text="Container volume (bars)", secondary_y=True,
-                     rangemode="tozero", showgrid=False)
+                     rangemode="tozero", showgrid=False, automargin=True)
+
+    # Stack annotations under the chart: singles list + small-sample warning.
+    notes: List[str] = []
+    s_line = _singles_summary(stddev_df, agg_period)
+    if s_line:
+        notes.append(s_line)
+    warn = _small_sample_warning(total_shipments, lane_label)
+    if warn:
+        notes.append(warn)
+    _add_bottom_annotations(fig, notes)
+
     return fig
 
 
-def fig_to_png_bytes(fig, width=1600, height=720, scale=2) -> bytes:
+def fig_to_png_bytes(fig, width=1600, height=780, scale=2) -> bytes:
     return fig.to_image(format="png", width=width, height=height, scale=scale, engine="kaleido")
 
 
@@ -699,12 +745,7 @@ def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _autosize(writer, sheet_name: str, df: pd.DataFrame):
-    """
-    Column-width auto-sizer. Bulletproofed against any dtype/value weirdness —
-    runs each value through str() inside the comprehension, and falls back to
-    just the header length on any unexpected error so it can never crash the
-    Excel write.
-    """
+    """Bulletproof column-width sizer. Falls back to header length on any error."""
     ws = writer.sheets[sheet_name]
     for i, col in enumerate(df.columns):
         header_len = len(str(col))
@@ -759,8 +800,6 @@ def write_excel(
     return buf.getvalue()
 
 
-# ---- Per-lane trend exports (6 sheets + Key) ----
-
 def _key_sheet_df() -> pd.DataFrame:
     rows = [
         ("HOW TO READ THIS FILE",
@@ -769,8 +808,8 @@ def _key_sheet_df() -> pd.DataFrame:
         ("", ""),
         ("THE SHEETS IN THIS FILE", ""),
         ("Key", "This sheet. Quick guide to everything else."),
-        ("Average-Weekly",   "Numbers behind transit_avg_weekly.png."),
-        ("Average-Monthly",  "Numbers behind transit_avg_monthly.png."),
+        ("Average-Weekly",   "Numbers behind transit_average_weekly.png."),
+        ("Average-Monthly",  "Numbers behind transit_average_monthly.png."),
         ("Median-Weekly",    "Numbers behind transit_median_weekly.png."),
         ("Median-Monthly",   "Numbers behind transit_median_monthly.png."),
         ("StdDev-Weekly",    "Numbers behind stddev_weekly.png."),
@@ -803,26 +842,24 @@ def _key_sheet_df() -> pd.DataFrame:
                          "combined std dev. Gray bars (right axis) = container volume. "
                          "LOWER = MORE CONSISTENT."),
         ("Use it for", "Picking reliable carriers. A carrier with low std dev is predictable."),
-        ("Hollow markers", "Mean the carrier had only 1 shipment that bucket — std dev is N/A."),
+        ("Below-chart text on stddev charts",
+         "Lists any single-shipment buckets (std dev N/A) so you can see the carrier "
+         "was active even though no consistency could be measured."),
         ("", ""),
         ("CARE", "If SHIPMENT_COUNT in a bucket is small (say <5), treat both avg and "
-                 "std dev as noisy signals — small sample, low confidence."),
+                 "std dev as noisy signals — small sample, low confidence. The chart "
+                 "will show a '⚠️ Small sample' warning when the total is low."),
     ]
     return pd.DataFrame(rows, columns=["Field", "Explanation"])
 
 
 def _format_key_sheet(writer, ws):
-    """Light styling on the Key sheet: wider columns + wrap."""
     wb = writer.book
-    header_fmt = wb.add_format({"bold": True, "bg_color": "#f0f2f5", "border": 1})
-    field_fmt  = wb.add_format({"bold": True, "valign": "top"})
-    body_fmt   = wb.add_format({"text_wrap": True, "valign": "top"})
-    section_fmt = wb.add_format({"bold": True, "bg_color": "#e8eef5",
-                                 "valign": "top"})
-    ws.set_column("A:A", 32, field_fmt)
+    field_fmt   = wb.add_format({"bold": True, "valign": "top"})
+    body_fmt    = wb.add_format({"text_wrap": True, "valign": "top"})
+    section_fmt = wb.add_format({"bold": True, "bg_color": "#e8eef5", "valign": "top"})
+    ws.set_column("A:A", 36, field_fmt)
     ws.set_column("B:B", 95, body_fmt)
-    ws.set_row(0, None, header_fmt)
-    # Bold rows whose Field is uppercase (section headers)
     df = _key_sheet_df()
     for idx, val in enumerate(df["Field"].tolist(), start=1):
         if val and val == val.upper() and len(val) > 3:
@@ -833,8 +870,6 @@ def write_trend_pack_excel(
     calc: pd.DataFrame, lane_selection: str,
     carrier_selection: Tuple[str, ...],
 ) -> bytes:
-    """6 data sheets + Key. Used both for the lane-specific zip companion
-    and for the in-app 'all 4 / 6 combinations' download."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         key_df = _key_sheet_df()
@@ -844,9 +879,7 @@ def write_trend_pack_excel(
 
         for metric in ("Average", "Median"):
             for agg in ("Weekly", "Monthly"):
-                tf = build_transit_frame(
-                    calc, lane_selection, carrier_selection, metric, agg
-                )
+                tf = build_transit_frame(calc, lane_selection, carrier_selection, metric, agg)
                 sheet = f"{metric}-{agg}"[:31]
                 if tf.empty:
                     pd.DataFrame({"info": ["No data for this combination."]}) \
@@ -875,7 +908,6 @@ def write_trend_pack_zip(
     start_code: str, end_code: str, aggregation_level: str,
     show_volume=True, show_combined=True, show_per_carrier=True,
 ) -> bytes:
-    """6 PNGs: 4 transit (avg/median × weekly/monthly) + 2 std-dev (weekly/monthly)."""
     lane_label = "All Lanes" if lane_selection == "All Lanes" else lane_selection
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -904,11 +936,6 @@ def write_trend_pack_zip(
 
 
 def _safe_lane_name(lane: str) -> str:
-    """
-    Sanitize lane string into a filesystem-safe folder name.
-    'VNHPH - Hai Phong, VN → USSAV - Savannah, US' → 'VNHPH_USSAV'
-    Falls back to a sanitized full lane string if LOCODE parsing fails.
-    """
     parts = lane.split(" → ")
     if len(parts) == 2:
         pol = parts[0].split(" - ")[0].strip()
@@ -925,74 +952,52 @@ def write_bulk_lane_pack_zip(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     master_excel_bytes: Optional[bytes] = None,
 ) -> bytes:
-    """
-    Build ONE master ZIP containing per-lane folders. Each lane folder holds
-    the 6 PNGs (4 transit + 2 std-dev) plus the data Excel (Key + 6 sheets).
-    Lanes stay independent — each pack uses the carriers active on THAT lane.
-
-    If `master_excel_bytes` is provided, it's dropped at the root of the ZIP
-    as `00_master_report.xlsx` so the bulk pack carries the full deliverable.
-    """
+    """Master ZIP: master Excel at root + per-lane folders (6 PNGs + Excel each) + README."""
     zbuf = io.BytesIO()
     skipped: List[str] = []
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as outer:
         for i, lane in enumerate(lanes):
             if progress_callback:
                 progress_callback(i, len(lanes), lane)
-
             lane_calc = calc[calc["LANE"] == lane]
             if lane_calc.empty:
-                skipped.append(lane)
-                continue
+                skipped.append(lane); continue
             lane_carriers = tuple(sorted(
                 lane_calc["CARRIER_NAME"].dropna().unique().tolist()
             ))
             if not lane_carriers:
-                skipped.append(lane)
-                continue
+                skipped.append(lane); continue
 
             folder = _safe_lane_name(lane) + "/"
 
-            # 4 transit PNGs
             for metric in ("Average", "Median"):
                 for agg in ("Weekly", "Monthly"):
                     tf = build_transit_frame(calc, lane, lane_carriers, metric, agg)
-                    if tf.empty:
-                        continue
+                    if tf.empty: continue
                     fig = make_transit_figure(
                         tf, start_code, end_code, aggregation_level,
                         metric, agg, lane,
                         show_volume, show_combined, show_per_carrier,
                     )
-                    outer.writestr(
-                        folder + f"transit_{metric.lower()}_{agg.lower()}.png",
-                        fig_to_png_bytes(fig),
-                    )
+                    outer.writestr(folder + f"transit_{metric.lower()}_{agg.lower()}.png",
+                                   fig_to_png_bytes(fig))
 
-            # 2 std-dev PNGs
             for agg in ("Weekly", "Monthly"):
                 sf = build_stddev_frame(calc, lane, lane_carriers, agg)
-                if sf.empty:
-                    continue
+                if sf.empty: continue
                 fig = make_stddev_figure(
                     sf, start_code, end_code, aggregation_level,
                     agg, lane,
                     show_volume, show_combined, show_per_carrier,
                 )
-                outer.writestr(
-                    folder + f"stddev_{agg.lower()}.png",
-                    fig_to_png_bytes(fig),
-                )
+                outer.writestr(folder + f"stddev_{agg.lower()}.png", fig_to_png_bytes(fig))
 
-            # Excel (Key + 6 sheets)
             excel_bytes = write_trend_pack_excel(calc, lane, lane_carriers)
             outer.writestr(folder + "data_with_key.xlsx", excel_bytes)
 
-        # Master Excel at root (if provided)
         if master_excel_bytes is not None:
             outer.writestr("00_master_report.xlsx", master_excel_bytes)
 
-        # Root README.txt
         included = [l for l in lanes if l not in skipped]
         readme_lines = [
             "Bulk lane export",
@@ -1249,7 +1254,6 @@ with tab4:
             with ov_c3:
                 show_per_carrier = st.checkbox("Per-carrier lines", value=True)
 
-        # Carriers list — expand "All Carriers" to actual names so combined is meaningful
         if "All Carriers" in carrier_choice:
             effective_carriers = tuple(carrier_pool)
         else:
@@ -1267,14 +1271,28 @@ with tab4:
         if transit_df.empty:
             st.info("No data for this lane × carrier combination.")
         else:
-            # CHART 1 — Transit time
+            st.markdown(
+                f"##### Chart 1 — Transit time ({metric_choice.lower()} per shipment)"
+            )
+            st.caption(
+                "Colored lines = per-carrier average. **Black line = combined average** "
+                "across all selected carriers (pooled). Gray bars (right axis) = container "
+                "volume per bucket. Use this for setting SAP lead times."
+            )
             fig1 = make_transit_figure(
                 transit_df, start_code, end_code, agg_level, metric_choice, agg_choice,
                 lane_label, show_volume, show_combined, show_per_carrier,
             )
             st.plotly_chart(fig1, use_container_width=True)
 
-            # CHART 2 — Std dev
+            st.markdown("##### Chart 2 — Transit-time consistency (std dev)")
+            st.caption(
+                "**Different metric from Chart 1.** Here we plot the *standard deviation* — "
+                "how spread out individual shipment transit times are around the bucket "
+                "average. Colored dotted lines = per-carrier std dev. **Bold dashed black "
+                "line = combined std dev** across all selected carriers (pooled). Lower = "
+                "more consistent. Use this for picking reliable carriers."
+            )
             fig2 = make_stddev_figure(
                 stddev_df, start_code, end_code, agg_level, agg_choice,
                 lane_label, show_volume, show_combined, show_per_carrier,
@@ -1299,25 +1317,18 @@ with tab4:
                     f"Lower = more consistent. Blank when SHIPMENT_COUNT < 2."
                 )
                 st.markdown("**Transit data (current view)**")
-                st.dataframe(
-                    transit_df.drop(columns=["IS_COMBINED"]),
-                    use_container_width=True, hide_index=True,
-                )
+                st.dataframe(transit_df.drop(columns=["IS_COMBINED"], errors="ignore"),
+                             use_container_width=True, hide_index=True)
                 st.markdown("**Std dev data (current view)**")
-                st.dataframe(
-                    stddev_df.drop(columns=["IS_COMBINED"]),
-                    use_container_width=True, hide_index=True,
-                )
+                st.dataframe(stddev_df.drop(columns=["IS_COMBINED"], errors="ignore"),
+                             use_container_width=True, hide_index=True)
 
-            # -------- Exports --------
             st.markdown("**Export charts / data**")
             scope = st.radio(
                 "Scope",
                 ["Current view only", "Full pack (6 charts + Key sheet)"],
                 horizontal=True, key="trend_scope",
-                help="Full pack = 4 transit PNGs (avg/median × weekly/monthly) + "
-                     "2 std-dev PNGs (weekly/monthly), plus the Excel with all 6 "
-                     "data sheets and a Key sheet.",
+                help="Full pack = 4 transit PNGs + 2 std-dev PNGs + Excel with Key + 6 data sheets.",
             )
 
             col_dl1, col_dl2 = st.columns(2)
@@ -1326,23 +1337,16 @@ with tab4:
                     try:
                         single_zip = io.BytesIO()
                         with zipfile.ZipFile(single_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-                            zf.writestr(
-                                f"transit_{metric_choice.lower()}_{agg_choice.lower()}.png",
-                                fig_to_png_bytes(fig1),
-                            )
-                            zf.writestr(
-                                f"stddev_{agg_choice.lower()}.png",
-                                fig_to_png_bytes(fig2),
-                            )
+                            zf.writestr(f"transit_{metric_choice.lower()}_{agg_choice.lower()}.png",
+                                        fig_to_png_bytes(fig1))
+                            zf.writestr(f"stddev_{agg_choice.lower()}.png",
+                                        fig_to_png_bytes(fig2))
                         st.download_button(
                             "⬇️ Download both charts (PNG, zipped)",
                             data=single_zip.getvalue(),
-                            file_name=_filename(
-                                "charts", lane_choice, carrier_choice, "zip",
-                                suffix=f"{metric_choice.lower()}-{agg_choice.lower()}",
-                            ),
-                            mime="application/zip",
-                            use_container_width=True,
+                            file_name=_filename("charts", lane_choice, carrier_choice, "zip",
+                                                suffix=f"{metric_choice.lower()}-{agg_choice.lower()}"),
+                            mime="application/zip", use_container_width=True,
                         )
                     except Exception as e:
                         st.caption(f"PNG export failed: {e}")
@@ -1357,25 +1361,21 @@ with tab4:
                         "⬇️ Download all 6 charts as ZIP (PNG)",
                         data=zip_bytes,
                         file_name=_filename("trend-pack", lane_choice, carrier_choice, "zip"),
-                        mime="application/zip",
-                        use_container_width=True,
+                        mime="application/zip", use_container_width=True,
                     )
 
             with col_dl2:
                 if scope == "Current view only":
-                    # Two-sheet excel: current transit metric + current std-dev
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
                         key_df = _key_sheet_df()
                         key_df.to_excel(w, sheet_name="Key", index=False)
                         _format_key_sheet(w, w.sheets["Key"])
                         w.sheets["Key"].freeze_panes(1, 0)
-
                         t_view = transit_df.drop(columns=["IS_COMBINED"], errors="ignore")
                         t_sheet = f"{metric_choice}-{agg_choice}"[:31]
                         t_view.to_excel(w, sheet_name=t_sheet, index=False)
                         _autosize(w, t_sheet, t_view)
-
                         s_view = stddev_df.drop(columns=["IS_COMBINED"], errors="ignore")
                         s_sheet = f"StdDev-{agg_choice}"[:31]
                         s_view.to_excel(w, sheet_name=s_sheet, index=False)
@@ -1383,18 +1383,14 @@ with tab4:
                     st.download_button(
                         "⬇️ Download current data as Excel (Key + 2 sheets)",
                         data=buf.getvalue(),
-                        file_name=_filename(
-                            "data", lane_choice, carrier_choice, "xlsx",
-                            suffix=f"{metric_choice.lower()}-{agg_choice.lower()}",
-                        ),
+                        file_name=_filename("data", lane_choice, carrier_choice, "xlsx",
+                                            suffix=f"{metric_choice.lower()}-{agg_choice.lower()}"),
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
                 else:
                     with st.spinner("Building 6-sheet Excel + Key…"):
-                        xlsx_bytes = write_trend_pack_excel(
-                            calc, lane_choice, effective_carriers
-                        )
+                        xlsx_bytes = write_trend_pack_excel(calc, lane_choice, effective_carriers)
                     st.download_button(
                         "⬇️ Download full pack as Excel (Key + 6 sheets)",
                         data=xlsx_bytes,
@@ -1410,14 +1406,12 @@ with tab4:
         st.subheader("📦 Bulk lane export")
         st.caption(
             "Generate ONE master ZIP that bundles a full pack for every lane "
-            "you pick. Each lane gets its own folder inside the ZIP with the 6 "
-            "PNGs + the data Excel (Key + 6 sheets). Lanes stay independent — "
-            "no combining or averaging across lanes. Useful when you need to "
-            "send a customer the same deliverable for many lanes at once."
+            "you pick (plus the master report at the root). Each lane gets its "
+            "own folder inside the ZIP with the 6 PNGs + the data Excel (Key + "
+            "6 sheets). Lanes stay independent — no combining."
         )
 
         bulk_pool = lanes_sorted
-
         include_all = st.checkbox(
             f"Include ALL {len(bulk_pool)} lanes (otherwise pick below)",
             value=False, key="bulk_include_all",
@@ -1428,15 +1422,13 @@ with tab4:
         else:
             bulk_lanes = st.multiselect(
                 "Lanes to include in the bulk pack",
-                options=bulk_pool,
-                default=[],
+                options=bulk_pool, default=[],
                 help="Each selected lane becomes its own folder in the master ZIP. "
                      "All carriers active on each lane are included automatically.",
                 key="bulk_lanes_select",
             )
 
         if bulk_lanes:
-            # Per-lane PNG render is ~0.5s; 1 lane = 6 renders + 1 Excel ≈ 4s.
             est_seconds = max(3, int(len(bulk_lanes) * 4))
             est_str = (f"~{est_seconds}s" if est_seconds < 60
                        else f"~{est_seconds // 60}m {est_seconds % 60}s")
@@ -1455,9 +1447,6 @@ with tab4:
                     progress.progress(pct, text=f"Lane {i+1} of {total}: {lane}")
 
                 try:
-                    # Build the master report Excel once and include it at the
-                    # root of the bulk ZIP, so the customer-facing deliverable
-                    # is fully self-contained in one download.
                     master_xlsx = write_excel(
                         calc, missed, lane_sum,
                         start_code, end_code, agg_level, results["raw_count"],
@@ -1482,10 +1471,9 @@ with tab4:
                 st.session_state["bulk_pack"] = {
                     "bytes": bulk_bytes,
                     "lanes": list(bulk_lanes),
-                    "params": current_params,  # invalidate on config change
+                    "params": current_params,
                 }
 
-        # Persist download button between reruns
         bulk_pack = st.session_state.get("bulk_pack")
         if bulk_pack and bulk_pack.get("params") == current_params:
             st.download_button(
@@ -1497,9 +1485,7 @@ with tab4:
                     f"{start_code}-{end_code}_"
                     f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
                 ),
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
+                mime="application/zip", type="primary", use_container_width=True,
                 key="bulk_download_btn",
             )
 
@@ -1520,6 +1506,5 @@ st.download_button(
     data=main_xlsx,
     file_name=fname,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    type="primary",
-    use_container_width=True,
+    type="primary", use_container_width=True,
 )
